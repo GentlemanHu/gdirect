@@ -146,9 +146,9 @@ fn direct_ip(db: &store::Store, ip: Option<IpAddr>) -> Result<IpAddr> {
     if let Some(ip) = ip {
         return Ok(ip);
     }
-    match db.best_ip()? {
-        Some(ip) => Ok(ip),
-        None => scan::run(db, None),
+    match db.best_route()? {
+        Some(route) => Ok(route.ip),
+        None => Ok(scan::run(db, None)?.ip),
     }
 }
 fn run(cli: Cli) -> Result<()> {

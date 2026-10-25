@@ -20,6 +20,16 @@ pub struct Endpoint {
     pub ip: String,
     pub latency_ms: Option<i64>,
     pub error: Option<String>,
+    /// The TLS identity that worked: "" for the real hostname, "g.cn" when a
+    /// forged identity was needed (e.g. real SNI is reset on the path).
+    pub sni: String,
+}
+/// What `best_route`/`scan` return: the endpoint and its working TLS identity.
+pub struct Route {
+    pub ip: std::net::IpAddr,
+    /// Empty means the real hostname; "g.cn" means connect and verify as g.cn
+    /// while the HTTP Host header carries the real Google hostname.
+    pub sni: String,
 }
 pub struct Store {
     conn: Connection,
@@ -57,20 +67,44 @@ impl Store {
             CREATE TABLE IF NOT EXISTS auth(id INTEGER PRIMARY KEY CHECK(id=1),account TEXT NOT NULL,token TEXT NOT NULL,expires_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
             DROP TABLE IF EXISTS downloads;")?;
+        // Added later: which TLS identity worked. Older databases gain it here.
+        let has_sni = conn
+            .prepare("PRAGMA table_info(endpoints)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "sni");
+        if !has_sni {
+            conn.execute_batch("ALTER TABLE endpoints ADD COLUMN sni TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(Self { conn })
     }
     // verified_at is the last successful probe; failures keep it so stale IPs age out.
-    pub fn endpoint(&self, ip: &str, latency: Option<i64>, error: Option<&str>) -> Result<()> {
+    pub fn endpoint(
+        &self,
+        ip: &str,
+        latency: Option<i64>,
+        error: Option<&str>,
+        sni: &str,
+    ) -> Result<()> {
         match latency {
             Some(ms) => self.conn.execute(
-                "INSERT OR REPLACE INTO endpoints VALUES(?,?,?,1,NULL)",
-                params![ip, ms, now()],
+                "INSERT OR REPLACE INTO endpoints VALUES(?,?,?,1,NULL,?)",
+                params![ip, ms, now(), sni],
             )?,
             None => self.conn.execute(
-                "INSERT INTO endpoints VALUES(?,NULL,0,0,?) ON CONFLICT(ip) DO UPDATE SET latency_ms=NULL,available=0,error=excluded.error",
-                params![ip, error],
+                "INSERT INTO endpoints VALUES(?,NULL,0,0,?,?) ON CONFLICT(ip) DO UPDATE SET latency_ms=NULL,available=0,error=excluded.error",
+                params![ip, error, sni],
             )?,
         };
+        Ok(())
+    }
+    /// The fallback identity proved itself: make it the stored one for this IP.
+    pub fn set_sni(&self, ip: &str, sni: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE endpoints SET sni=?,available=1,verified_at=? WHERE ip=?",
+            params![sni, now(), ip],
+        )?;
         Ok(())
     }
     // Prunes endpoints without a success in 7 days and returns the best `limit` remaining.
@@ -86,13 +120,19 @@ impl Store {
             .query_map([limit as i64], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    pub fn best_ip(&self) -> Result<Option<std::net::IpAddr>> {
-        let ip:Option<String>=self.conn.query_row("SELECT ip FROM endpoints WHERE available=1 AND verified_at>? ORDER BY latency_ms LIMIT 1",[now()-86400],|r|r.get(0)).optional()?;
-        ip.map(|s| s.parse().map_err(Into::into)).transpose()
+    pub fn best_route(&self) -> Result<Option<Route>> {
+        let row = self.conn.query_row("SELECT ip,sni FROM endpoints WHERE available=1 AND verified_at>? ORDER BY latency_ms LIMIT 1",[now()-86400],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
+        row.map(|(ip, sni)| {
+            Ok(Route {
+                ip: ip.parse()?,
+                sni,
+            })
+        })
+        .transpose()
     }
     pub fn endpoints(&self) -> Result<Vec<Endpoint>> {
         let mut query = self.conn.prepare(
-            "SELECT ip,latency_ms,error FROM endpoints ORDER BY available DESC,latency_ms",
+            "SELECT ip,latency_ms,error,sni FROM endpoints ORDER BY available DESC,latency_ms",
         )?;
         Ok(query
             .query_map([], |r| {
@@ -100,6 +140,7 @@ impl Store {
                     ip: r.get(0)?,
                     latency_ms: r.get(1)?,
                     error: r.get(2)?,
+                    sni: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -180,29 +221,61 @@ mod tests {
     #[test]
     fn endpoints_require_recent_success() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER,available INTEGER,error TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER,available INTEGER,error TEXT,sni TEXT NOT NULL DEFAULT '');").unwrap();
         let db = Store { conn };
-        db.endpoint("183.56.143.147", Some(40), None).unwrap();
-        db.endpoint("8.8.8.8", Some(80), None).unwrap();
-        assert_eq!(db.best_ip().unwrap().unwrap().to_string(), "183.56.143.147");
-        db.endpoint("183.56.143.147", None, Some("timeout"))
+        db.endpoint("183.56.143.147", Some(40), None, "g.cn")
             .unwrap();
-        assert_eq!(db.best_ip().unwrap().unwrap().to_string(), "8.8.8.8");
+        db.endpoint("8.8.8.8", Some(80), None, "").unwrap();
+        let route = db.best_route().unwrap().unwrap();
+        assert_eq!(route.ip.to_string(), "183.56.143.147");
+        assert_eq!(route.sni, "g.cn");
+        db.endpoint("183.56.143.147", None, Some("timeout"), "")
+            .unwrap();
+        assert_eq!(db.best_route().unwrap().unwrap().ip.to_string(), "8.8.8.8");
         db.conn
             .execute("UPDATE endpoints SET verified_at=0", [])
             .unwrap();
-        assert!(db.best_ip().unwrap().is_none());
+        assert!(db.best_route().unwrap().is_none());
+    }
+    #[test]
+    fn fallback_identity_is_persisted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER,available INTEGER,error TEXT,sni TEXT NOT NULL DEFAULT '');").unwrap();
+        let db = Store { conn };
+        db.endpoint("8.8.8.8", Some(10), None, "").unwrap();
+        db.set_sni("8.8.8.8", "g.cn").unwrap();
+        let route = db.best_route().unwrap().unwrap();
+        assert_eq!(route.sni, "g.cn");
+        db.endpoint("8.8.8.8", None, Some("reset"), "").unwrap();
+        assert!(db.best_route().unwrap().is_none());
+        db.set_sni("8.8.8.8", "g.cn").unwrap();
+        assert_eq!(db.best_route().unwrap().unwrap().sni, "g.cn");
+    }
+    #[test]
+    fn old_databases_gain_the_sni_column() {
+        let path =
+            std::env::temp_dir().join(format!("gdirect-migrate-{}.sqlite3", std::process::id()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER NOT NULL,available INTEGER NOT NULL,error TEXT);").unwrap();
+        }
+        let db = Store::open(&path).unwrap();
+        db.endpoint("8.8.8.8", Some(10), None, "g.cn").unwrap();
+        assert_eq!(db.best_route().unwrap().unwrap().sni, "g.cn");
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
     #[test]
     fn stale_endpoints_are_pruned() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER NOT NULL,available INTEGER NOT NULL,error TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE endpoints(ip TEXT PRIMARY KEY,latency_ms INTEGER,verified_at INTEGER NOT NULL,available INTEGER NOT NULL,error TEXT,sni TEXT NOT NULL DEFAULT '');").unwrap();
         let db = Store { conn };
-        db.endpoint("1.0.0.1", Some(30), None).unwrap();
-        db.endpoint("1.0.0.2", Some(10), None).unwrap();
-        db.endpoint("1.0.0.3", Some(20), None).unwrap();
-        db.endpoint("1.0.0.3", None, Some("timeout")).unwrap();
-        db.endpoint("1.0.0.4", None, Some("never worked")).unwrap();
+        db.endpoint("1.0.0.1", Some(30), None, "").unwrap();
+        db.endpoint("1.0.0.2", Some(10), None, "").unwrap();
+        db.endpoint("1.0.0.3", Some(20), None, "").unwrap();
+        db.endpoint("1.0.0.3", None, Some("timeout"), "").unwrap();
+        db.endpoint("1.0.0.4", None, Some("never worked"), "")
+            .unwrap();
         db.conn
             .execute(
                 "UPDATE endpoints SET verified_at=? WHERE ip='1.0.0.1'",
@@ -218,7 +291,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("gdirect-logout-{}.sqlite3", std::process::id()));
         let db = Store::open(&path).unwrap();
-        db.endpoint("8.8.8.8", Some(10), None).unwrap();
+        db.endpoint("8.8.8.8", Some(10), None, "").unwrap();
         db.save_auth("test@example.com", "secret", 3600).unwrap();
         db.set("oauth_credentials", "{}").unwrap();
         db.set("upload:x", "{}").unwrap();
@@ -231,7 +304,7 @@ mod tests {
         assert!(db.setting("oauth_credentials").unwrap().is_none());
         assert!(db.setting("upload:x").unwrap().is_none());
         assert_eq!(db.setting("connections").unwrap().as_deref(), Some("4"));
-        assert!(db.best_ip().unwrap().is_some());
+        assert!(db.best_route().unwrap().is_some());
         assert!(db.clear_auth().unwrap().is_none());
         drop(db);
         let _ = std::fs::remove_file(path);
