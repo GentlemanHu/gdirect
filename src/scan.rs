@@ -111,7 +111,7 @@ fn probe(ip: IpAddr) -> Result<(i64, Option<String>)> {
     };
     Ok((start.elapsed().as_millis() as i64, warning))
 }
-pub fn run(db: &Store, path: Option<&Path>) -> Result<IpAddr> {
+pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
     let ips = candidates(db, path)?;
     eprintln!(
         "Scanning {} candidates (TLS + Drive API + test download)…",
@@ -154,19 +154,19 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<IpAddr> {
                     );
                     warned = true;
                 }
-                db.endpoint(&ip.to_string(), Some(ms), None)?;
+                db.endpoint(&ip.to_string(), Some(ms), None, "")?;
                 eprintln!("  OK  {ip}  {ms} ms");
             }
             Err(error) => {
-                db.endpoint(&ip.to_string(), None, Some(&error))?;
+                db.endpoint(&ip.to_string(), None, Some(&error), "")?;
                 eprintln!("  --  {ip}  unavailable");
             }
         }
         Ok(())
     })?;
-    let ip=db.best_ip()?.context("no usable IP found; verify system direct routing or provide candidates with gdirect scan --ips FILE")?;
+    let route=db.best_route()?.context("no usable IP found; verify system direct routing or provide candidates with gdirect scan --ips FILE")?;
     eprintln!("Selected a verified endpoint; saved in SQLite.");
-    Ok(ip)
+    Ok(route)
 }
 #[cfg(test)]
 mod tests {
