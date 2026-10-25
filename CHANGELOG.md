@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- `browse` can queue several files at once: Space marks a file or folder, `a` marks every file in the current folder, Esc clears marks, and `d` queues everything marked.
+- `d` on a folder downloads it with all subfolders into `<output>/<folder name>/`, keeping the folder structure.
+- The file list shows each file's size and download state. The Downloads panel lists every job with overall progress, and the preview shows the full error of a failed download.
+- `R` retries failed or cancelled downloads; `x` removes downloads that have not started.
+
+### Fixed
+
+- `browse` crashed with a segmentation fault when the second download started. libaria2 is now initialised once per process.
+- Files with the same name queued in one session no longer collide; later ones are saved as `name (2).ext`.
+
 ## 0.2.0
 
 ### Breaking changes
