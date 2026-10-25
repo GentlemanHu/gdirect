@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+const FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,resourceKey";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct File {
@@ -119,27 +120,122 @@ impl Api {
         Ok(email)
     }
     fn get(&self, path: &str, query: &[(String, String)]) -> Result<serde_json::Value> {
-        let token = self.token()?;
+        self.request(reqwest::Method::GET, path, query, None)
+    }
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let url = format!("https://www.googleapis.com/drive/v3/{path}");
-        let mut response = self
-            .client
-            .get(&url)
-            .query(query)
-            .bearer_auth(token)
-            .send()
-            .map_err(|e| e.without_url())?;
+        let send = |token: String| {
+            let mut request = self
+                .client
+                .request(method.clone(), &url)
+                .query(query)
+                .bearer_auth(token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            request.send().map_err(|e| e.without_url())
+        };
+        let mut response = send(self.token()?)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && std::env::var_os("GDIRECT_ACCESS_TOKEN").is_none()
         {
-            response = self
-                .client
-                .get(&url)
-                .query(query)
-                .bearer_auth(self.refresh()?)
-                .send()
-                .map_err(|e| e.without_url())?;
+            response = send(self.refresh()?)?;
         }
         checked(response)
+    }
+    /// Sends a metadata change and returns the file as Drive now reports it.
+    fn write(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        extra: &[(&str, &str)],
+        body: serde_json::Value,
+    ) -> Result<File> {
+        let mut query: Vec<(String, String)> = vec![
+            ("fields".into(), FIELDS.into()),
+            ("supportsAllDrives".into(), "true".into()),
+        ];
+        query.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let data = self.request(method, path, &query, Some(&body))?;
+        Ok(serde_json::from_value(data)?)
+    }
+    /// Creates an empty file, or a folder when `folder` is set.
+    pub fn create(&self, parent: &str, name: &str, folder: bool) -> Result<File> {
+        ensure!(crate::drive::valid_id(parent), "invalid folder ID");
+        let mut body = serde_json::json!({"name": checked_name(name)?, "parents": [parent]});
+        if folder {
+            body["mimeType"] = "application/vnd.google-apps.folder".into();
+        }
+        self.write(reqwest::Method::POST, "files", &[], body)
+    }
+    pub fn rename(&self, id: &str, name: &str) -> Result<File> {
+        ensure!(crate::drive::valid_id(id), "invalid file ID");
+        let body = serde_json::json!({"name": checked_name(name)?});
+        self.write(reqwest::Method::PATCH, &format!("files/{id}"), &[], body)
+    }
+    /// Moves a file to the Drive trash, where it can still be restored.
+    pub fn trash(&self, id: &str) -> Result<File> {
+        ensure!(crate::drive::valid_id(id), "invalid file ID");
+        let body = serde_json::json!({"trashed": true});
+        self.write(reqwest::Method::PATCH, &format!("files/{id}"), &[], body)
+    }
+    /// Copies a file (not a folder; Drive cannot copy those) into `parent`, keeping its name.
+    pub fn copy(&self, id: &str, parent: &str) -> Result<File> {
+        ensure!(
+            crate::drive::valid_id(id) && crate::drive::valid_id(parent),
+            "invalid file ID"
+        );
+        let body = serde_json::json!({"parents": [parent]});
+        self.write(
+            reqwest::Method::POST,
+            &format!("files/{id}/copy"),
+            &[],
+            body,
+        )
+    }
+    /// Moves a file or folder out of all its current folders into `parent`.
+    /// Returns false when it is already there.
+    pub fn move_to(&self, id: &str, parent: &str) -> Result<bool> {
+        ensure!(
+            crate::drive::valid_id(id) && crate::drive::valid_id(parent),
+            "invalid file ID"
+        );
+        let data = self.get(
+            &format!("files/{id}"),
+            &[
+                ("fields".into(), "parents".into()),
+                ("supportsAllDrives".into(), "true".into()),
+            ],
+        )?;
+        let parents: Vec<String> = serde_json::from_value(data["parents"].clone())?;
+        // "root" is an alias; Drive reports the real ID, so compare after resolving it.
+        let target = if parent == "root" {
+            self.metadata("root")?.id
+        } else {
+            parent.to_owned()
+        };
+        if parents == [target.as_str()] {
+            return Ok(false);
+        }
+        let remove = parents
+            .iter()
+            .filter(|p| **p != target)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        self.write(
+            reqwest::Method::PATCH,
+            &format!("files/{id}"),
+            &[("addParents", &target), ("removeParents", &remove)],
+            serde_json::json!({}),
+        )?;
+        Ok(true)
     }
     pub fn list(&self, folder: &str) -> Result<Vec<File>> {
         ensure!(crate::drive::valid_id(folder), "invalid folder ID");
@@ -171,10 +267,7 @@ impl Api {
         let data = self.get(
             &format!("files/{id}"),
             &[
-                (
-                    "fields".into(),
-                    "id,name,mimeType,size,modifiedTime,md5Checksum,resourceKey".into(),
-                ),
+                ("fields".into(), FIELDS.into()),
                 ("supportsAllDrives".into(), "true".into()),
             ],
         )?;
@@ -224,6 +317,15 @@ fn drive_error(status: reqwest::StatusCode, body: &str) -> String {
         );
     }
     format!("Drive API {status}: {message}")
+}
+fn checked_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    ensure!(!name.is_empty(), "name cannot be empty");
+    ensure!(
+        !name.chars().any(char::is_control),
+        "name cannot contain control characters"
+    );
+    Ok(name)
 }
 pub fn safe_name(name: &str) -> String {
     let cleaned: String = name

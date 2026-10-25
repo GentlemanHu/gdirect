@@ -1,17 +1,13 @@
+mod draw;
+
 use crate::{
     api::{Api, File},
     download::{self, Stats},
     store::Store,
 };
 use anyhow::{Result, ensure};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Layout},
-    style::{Color, Style, Stylize},
-    text::Line,
-    widgets::{Block, Gauge, List, ListItem, ListState, Paragraph, Wrap},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::widgets::ListState;
 use std::{
     collections::{HashSet, VecDeque},
     io::IsTerminal,
@@ -42,6 +38,8 @@ enum Message {
     Listing(String, usize),
     /// Every file below a folder, with the directory to save it in.
     Listed(String, Result<Vec<(File, PathBuf)>, String>),
+    /// A file operation finished: its status line and the file to select afterwards.
+    Operated(Result<(String, Option<String>), String>),
 }
 #[derive(Clone, Debug, PartialEq)]
 enum State {
@@ -63,17 +61,99 @@ struct Active {
     cancel: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
+/// Files yanked with y (copy) or x (cut), pasted into another folder with p.
+struct Clipboard {
+    files: Vec<File>,
+    cut: bool,
+}
+enum Prompt {
+    /// A name ending in / creates a folder.
+    Create,
+    Rename(File),
+    Trash(Vec<File>),
+    Upload,
+    Filter,
+}
+struct Input {
+    prompt: Prompt,
+    text: String,
+    /// Cursor position in characters.
+    cursor: usize,
+}
+impl Input {
+    fn new(prompt: Prompt, text: String) -> Self {
+        let cursor = text.chars().count();
+        Self {
+            prompt,
+            text,
+            cursor,
+        }
+    }
+    fn byte(&self, cursor: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(cursor)
+            .map_or(self.text.len(), |(i, _)| i)
+    }
+    /// Edits the text; returns false for keys that are not editing keys.
+    fn edit(&mut self, key: KeyEvent) -> bool {
+        let len = self.text.chars().count();
+        match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.text.clear();
+                self.cursor = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let at = self.byte(self.cursor);
+                self.text.insert(at, c);
+                self.cursor += 1;
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                let at = self.byte(self.cursor);
+                self.text.remove(at);
+            }
+            KeyCode::Delete if self.cursor < len => {
+                let at = self.byte(self.cursor);
+                self.text.remove(at);
+            }
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = len,
+            KeyCode::Backspace | KeyCode::Delete => {}
+            _ => return false,
+        }
+        true
+    }
+}
 struct View {
     path: Vec<(String, String)>,
+    /// Everything in the current folder.
+    entries: Vec<File>,
+    /// The entries matching the filter, as shown.
     files: Vec<File>,
+    filter: String,
+    /// The folder above, from the cache, for the parent column.
+    parent: Vec<File>,
     selection: ListState,
+    /// Rows in the file list, for page up/down.
+    page: usize,
     preview: Vec<File>,
     preview_id: Option<String>,
     status: String,
+    /// The status is a listing error that a successful refresh clears.
+    stale: bool,
     loading: bool,
     connections: u8,
-    /// Files marked with space, kept across folders until queued.
+    /// Files marked with space, kept across folders until used.
     marked: Vec<File>,
+    clipboard: Option<Clipboard>,
+    input: Option<Input>,
+    help: bool,
+    /// File operations still running.
+    busy: usize,
+    started: Instant,
     /// Every download of this session, in queue order.
     jobs: Vec<Job>,
     active: Option<Active>,
@@ -83,21 +163,36 @@ struct View {
 }
 impl View {
     fn new(path: (String, String), files: Vec<File>, connections: u8) -> Self {
-        Self {
+        let mut view = Self {
             path: vec![path],
-            selection: ListState::default().with_selected((!files.is_empty()).then_some(0)),
-            files,
+            entries: vec![],
+            files: vec![],
+            filter: String::new(),
+            parent: vec![],
+            selection: ListState::default(),
+            page: 10,
             preview: vec![],
             preview_id: None,
             status: String::new(),
+            stale: false,
             loading: true,
             connections,
             marked: vec![],
+            clipboard: None,
+            input: None,
+            help: false,
+            busy: 0,
+            started: Instant::now(),
             jobs: vec![],
             active: None,
             listing: 0,
             quitting: false,
-        }
+        };
+        view.set_entries(files, None);
+        view
+    }
+    fn folder(&self) -> &str {
+        &self.path.last().unwrap().0
     }
     fn selected(&self) -> Option<&File> {
         self.selection.selected().and_then(|i| self.files.get(i))
@@ -108,49 +203,117 @@ impl View {
     fn job_mut(&mut self, id: &str) -> Option<&mut Job> {
         self.jobs.iter_mut().find(|j| j.file.id == id)
     }
-    fn move_by(&mut self, delta: isize) {
+    fn marked(&self, file: &File) -> bool {
+        self.marked.iter().any(|m| m.id == file.id)
+    }
+    /// Replaces the folder listing, keeping the selection on `keep` or the current file.
+    fn set_entries(&mut self, files: Vec<File>, keep: Option<String>) {
+        let keep = keep.or_else(|| self.selected().map(|f| f.id.clone()));
+        self.entries = files;
+        self.apply_filter(keep);
+    }
+    fn apply_filter(&mut self, keep: Option<String>) {
+        let needle = self.filter.to_lowercase();
+        self.files = self
+            .entries
+            .iter()
+            .filter(|f| needle.is_empty() || f.name.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        let found = keep.and_then(|id| self.files.iter().position(|f| f.id == id));
+        let index = found.unwrap_or_else(|| self.selection.selected().unwrap_or(0));
+        self.selection.select(if self.files.is_empty() {
+            None
+        } else {
+            Some(index.min(self.files.len() - 1))
+        });
+    }
+    fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.selection.select(Some(0));
+        self.apply_filter(None);
+    }
+    /// Opens a subfolder whose cached listing is `files`.
+    fn enter(&mut self, folder: File, files: Vec<File>) {
+        self.path.push((folder.id, folder.name));
+        self.parent = std::mem::take(&mut self.entries);
+        self.filter.clear();
+        self.selection.select(Some(0));
+        self.set_entries(files, None);
+        self.loading = true;
+    }
+    /// Returns to the parent folder, selecting the folder just left.
+    fn leave(&mut self, files: Vec<File>, parent: Vec<File>) {
+        let (left, _) = self.path.pop().unwrap();
+        self.parent = parent;
+        self.filter.clear();
+        self.selection.select(Some(0));
+        self.set_entries(files, Some(left));
+        self.loading = true;
+    }
+    fn move_to(&mut self, index: isize) {
         if self.files.is_empty() {
             self.selection.select(None);
             return;
         }
-        let next = (self.selection.selected().unwrap_or(0) as isize + delta)
-            .clamp(0, self.files.len() as isize - 1) as usize;
+        let next = index.clamp(0, self.files.len() as isize - 1) as usize;
         self.selection.select(Some(next));
-        self.preview.clear();
-        self.preview_id = None;
+    }
+    fn move_by(&mut self, delta: isize) {
+        self.move_to(self.selection.selected().unwrap_or(0) as isize + delta);
     }
     fn toggle_mark(&mut self) {
         let Some(file) = self.selected().cloned() else {
             return;
         };
-        if !file.folder() && !file.downloadable() {
-            self.status = format!("{} cannot be downloaded", file.name);
-        } else if let Some(i) = self.marked.iter().position(|f| f.id == file.id) {
+        if let Some(i) = self.marked.iter().position(|f| f.id == file.id) {
             self.marked.remove(i);
         } else {
             self.marked.push(file);
         }
         self.move_by(1);
     }
-    /// Marks every downloadable file in this folder, or unmarks them when all are marked.
+    /// Marks everything shown, or unmarks it when all of it is marked.
     fn toggle_all(&mut self) {
-        let files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|f| !f.folder() && f.downloadable())
-            .cloned()
-            .collect();
-        if files
-            .iter()
-            .all(|f| self.marked.iter().any(|m| m.id == f.id))
-        {
+        let files = self.files.clone();
+        if files.iter().all(|f| self.marked(f)) {
             self.marked.retain(|m| !files.iter().any(|f| f.id == m.id));
         } else {
             for file in files {
-                if !self.marked.iter().any(|m| m.id == file.id) {
+                if !self.marked(&file) {
                     self.marked.push(file);
                 }
             }
+        }
+    }
+    /// The marked files, or the selected one; marks are used up.
+    fn take_picked(&mut self) -> Vec<File> {
+        if self.marked.is_empty() {
+            self.selected().cloned().into_iter().collect()
+        } else {
+            std::mem::take(&mut self.marked)
+        }
+    }
+    fn yank(&mut self, cut: bool) {
+        let files = self.take_picked();
+        if files.is_empty() {
+            return;
+        }
+        self.status = format!(
+            "{} {} · p pastes into the current folder",
+            if cut { "Cut" } else { "Copied" },
+            items(files.len())
+        );
+        self.clipboard = Some(Clipboard { files, cut });
+    }
+    /// Esc steps back: filter first, then marks, then the clipboard.
+    fn escape(&mut self) {
+        if !self.filter.is_empty() {
+            self.set_filter(String::new());
+        } else if !self.marked.is_empty() {
+            self.marked.clear();
+        } else {
+            self.clipboard = None;
         }
     }
     /// Drive allows duplicate names; give each job of this session its own output path.
@@ -259,282 +422,6 @@ impl View {
         }
         text
     }
-    fn draw(&mut self, frame: &mut Frame) {
-        let waiting = self.jobs.len() - usize::from(self.active.is_some());
-        let [header, browser, progress, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(6 + waiting.min(6) as u16),
-            Constraint::Length(2),
-        ])
-        .areas(frame.area());
-        let path = self
-            .path
-            .iter()
-            .map(|(_, name)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let mut title = vec![
-            " gdirect ".black().on_cyan().bold(),
-            format!("  {path}").cyan(),
-            format!("   {} connections / download", self.connections).gray(),
-        ];
-        if !self.marked.is_empty() {
-            title.push(format!("   {} marked", self.marked.len()).yellow().bold());
-        }
-        frame.render_widget(Paragraph::new(Line::from(title)), header);
-        let [list, preview] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(browser);
-        let items: Vec<_> = self
-            .files
-            .iter()
-            .map(|f| {
-                if f.folder() {
-                    return ListItem::new(Line::from(vec![
-                        if self.marked.iter().any(|m| m.id == f.id) {
-                            " ● ".yellow().bold()
-                        } else {
-                            " ▸ ".cyan()
-                        },
-                        format!("{:>9}  ", "").into(),
-                        f.name.clone().cyan(),
-                    ]));
-                }
-                let icon = if self.marked.iter().any(|m| m.id == f.id) {
-                    " ● ".yellow().bold()
-                } else {
-                    match self.job(&f.id).map(|j| &j.state) {
-                        Some(State::Queued) => " ◦ ".gray(),
-                        Some(State::Active) => " ↓ ".cyan().bold(),
-                        Some(State::Done) => " ✓ ".green(),
-                        Some(State::Failed(_)) => " ✗ ".red(),
-                        None => "   ".into(),
-                    }
-                };
-                let size = f
-                    .size
-                    .as_ref()
-                    .and_then(|s| s.parse().ok())
-                    .map(bytes)
-                    .unwrap_or_default();
-                let name = if f.downloadable() {
-                    f.name.clone().white()
-                } else {
-                    f.name.clone().dark_gray()
-                };
-                ListItem::new(Line::from(vec![
-                    icon,
-                    format!("{size:>9}  ").dark_gray(),
-                    name,
-                ]))
-            })
-            .collect();
-        let title = if self.loading {
-            " Files · refreshing ".into()
-        } else {
-            format!(" Files · {} ", self.files.len())
-        };
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(Block::bordered().title(title))
-                .highlight_style(Style::default().bg(Color::DarkGray).bold())
-                .highlight_symbol("›"),
-            list,
-            &mut self.selection,
-        );
-        let lines = match self.selected() {
-            Some(file) if file.folder() => {
-                let mut lines = vec![
-                    Line::from(file.name.clone()).cyan().bold(),
-                    Line::from("Folder · d downloads everything inside").cyan(),
-                    Line::from(""),
-                ];
-                if self.preview_id.as_deref() == Some(&file.id) && self.preview.is_empty() {
-                    lines.push(Line::from("Empty folder / loading…").dark_gray());
-                }
-                lines.extend(self.preview.iter().map(|f| {
-                    Line::from(format!(
-                        "{}{}",
-                        if f.folder() { "▸ " } else { "  " },
-                        f.name
-                    ))
-                }));
-                lines
-            }
-            Some(file) => {
-                let mut lines = vec![
-                    Line::from(file.name.clone()).bold(),
-                    Line::from(""),
-                    Line::from(file.mime_type.clone()),
-                    Line::from(format!(
-                        "Size     {}",
-                        file.size
-                            .as_ref()
-                            .and_then(|s| s.parse().ok())
-                            .map(bytes)
-                            .unwrap_or_else(|| "—".into())
-                    )),
-                    Line::from(format!(
-                        "Modified {}",
-                        file.modified_time.as_deref().unwrap_or("—")
-                    )),
-                    Line::from(""),
-                ];
-                lines.push(match self.job(&file.id) {
-                    _ if !file.downloadable() => {
-                        Line::from("Cannot be downloaded (shortcut, form, site or map)").dark_gray()
-                    }
-                    Some(job) => match &job.state {
-                        State::Queued => Line::from("Queued").gray(),
-                        State::Active => Line::from("Downloading…").cyan(),
-                        State::Done => {
-                            Line::from(format!("Saved {}", job.output.display())).green()
-                        }
-                        State::Failed(e) => Line::from(format!("Failed: {e}")).red(),
-                    },
-                    None if file.workspace() => Line::from("d  Export document as PDF").cyan(),
-                    None => Line::from("d  Download   space  Mark").cyan(),
-                });
-                lines
-            }
-            None => vec![Line::from(if self.loading {
-                "Loading Drive…"
-            } else {
-                "This folder is empty"
-            })],
-        };
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" Preview "))
-                .wrap(Wrap { trim: false }),
-            preview,
-        );
-        let mut title = if self.jobs.is_empty() {
-            " Downloads ".into()
-        } else {
-            format!(" Downloads · {} ", self.summary())
-        };
-        if self.listing > 0 {
-            title += &format!("· listing {} folders ", self.listing);
-        }
-        let block = Block::bordered().title(title);
-        let inner = block.inner(progress);
-        frame.render_widget(block, progress);
-        let [name, gauge, details, queue, message] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(inner);
-        if let Some((active, job)) = self
-            .active
-            .as_ref()
-            .and_then(|a| Some((a, self.job(&a.id)?)))
-        {
-            let s = active.stats;
-            let ratio = if s.total > 0 {
-                (s.done as f64 / s.total as f64).clamp(0., 1.)
-            } else {
-                0.
-            };
-            let position = self.jobs.iter().position(|j| j.file.id == active.id);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    format!("[{}/{}] ", position.map_or(0, |i| i + 1), self.jobs.len()).gray(),
-                    job.file.name.clone().bold(),
-                ])),
-                name,
-            );
-            frame.render_widget(
-                Gauge::default()
-                    .gauge_style(Style::default().fg(Color::Cyan))
-                    .ratio(ratio)
-                    .label(if s.total > 0 {
-                        format!("{:.1}%", ratio * 100.)
-                    } else {
-                        "Connecting…".into()
-                    }),
-                gauge,
-            );
-            let eta = s
-                .total
-                .saturating_sub(s.done)
-                .checked_div(s.speed)
-                .map(duration)
-                .unwrap_or_else(|| "—".into());
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{} / {}   {}/s   {} active connections   ETA {eta}",
-                    bytes(s.done),
-                    bytes(s.total),
-                    bytes(s.speed),
-                    s.connections
-                )),
-                details,
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(if self.jobs.is_empty() {
-                    "Ready · d downloads the selected file, space marks several"
-                } else {
-                    "Idle · d adds more, R retries failed downloads"
-                })
-                .dark_gray(),
-                name,
-            );
-        }
-        // Waiting work first, then failures, then the most recent successes.
-        let mut others: Vec<&Job> = self
-            .jobs
-            .iter()
-            .filter(|j| j.state == State::Queued)
-            .collect();
-        others.extend(
-            self.jobs
-                .iter()
-                .filter(|j| matches!(j.state, State::Failed(_))),
-        );
-        others.extend(self.jobs.iter().rev().filter(|j| j.state == State::Done));
-        let rows = queue.height as usize;
-        let shown = if others.len() > rows {
-            rows.saturating_sub(1)
-        } else {
-            rows
-        };
-        let mut lines: Vec<Line> = others
-            .iter()
-            .take(shown)
-            .map(|job| {
-                let size = job.size.map(bytes).unwrap_or_default();
-                match &job.state {
-                    State::Failed(e) => Line::from(vec![
-                        " ✗ ".red(),
-                        job.file.name.clone().into(),
-                        format!("  {e}").red(),
-                    ]),
-                    State::Done => Line::from(vec![
-                        " ✓ ".green(),
-                        job.file.name.clone().gray(),
-                        format!("  {size}").dark_gray(),
-                    ]),
-                    _ => Line::from(vec![
-                        " ◦ ".gray(),
-                        job.file.name.clone().into(),
-                        format!("  {size}").dark_gray(),
-                    ]),
-                }
-            })
-            .collect();
-        if others.len() > shown {
-            lines.push(Line::from(format!("   … {} more", others.len() - shown)).dark_gray());
-        }
-        frame.render_widget(Paragraph::new(lines), queue);
-        frame.render_widget(Paragraph::new(self.status.clone()).yellow(), message);
-        frame.render_widget(Paragraph::new(" j/k move  h/l back/open  space mark  a mark all files  esc unmark  d download (folders too)  +/- connections\n r refresh  c cancel current  R retry failed  x clear queue  q quit (keeps partial data)"),footer);
-    }
 }
 fn queued(added: &[String], skipped: usize) -> String {
     match (added, skipped) {
@@ -543,6 +430,13 @@ fn queued(added: &[String], skipped: usize) -> String {
         ([name], 0) => format!("Queued {name}"),
         (names, 0) => format!("Queued {} files", names.len()),
         (names, skipped) => format!("Queued {} files, skipped {skipped}", names.len()),
+    }
+}
+fn items(n: usize) -> String {
+    if n == 1 {
+        "1 item".into()
+    } else {
+        format!("{n} items")
     }
 }
 /// Lists every file below `folder`, paired with its directory relative to `folder`.
@@ -589,6 +483,19 @@ fn bytes(n: u64) -> String {
         format!("{n} B")
     }
 }
+/// A local path as typed or dropped into the terminal: quoted, escaped, or starting with ~.
+fn local_path(text: &str) -> PathBuf {
+    let text = text.trim();
+    let text = ['\'', '"']
+        .iter()
+        .find_map(|q| text.strip_prefix(*q)?.strip_suffix(*q))
+        .map(str::to_owned)
+        .unwrap_or_else(|| text.replace("\\ ", " "));
+    match text.strip_prefix("~/").zip(dirs::home_dir()) {
+        Some((rest, home)) => home.join(rest),
+        None => PathBuf::from(text),
+    }
+}
 fn fetch(api: &Api, tx: &Sender<Message>, id: String, preview: bool) {
     let api = api.clone();
     let tx = tx.clone();
@@ -600,6 +507,40 @@ fn fetch(api: &Api, tx: &Sender<Message>, id: String, preview: bool) {
             Message::Folder(id, result)
         });
     });
+}
+/// Runs a file operation in the background; the current folder is refreshed when it ends.
+fn operate(
+    api: &Api,
+    tx: &Sender<Message>,
+    work: impl FnOnce(&Api) -> Result<(String, Option<String>)> + Send + 'static,
+) {
+    let api = api.clone();
+    let tx = tx.clone();
+    thread::spawn(move || {
+        let result = work(&api).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Message::Operated(result));
+    });
+}
+/// Applies `each` to every file in turn, stopping at the first error.
+fn each(
+    files: &[File],
+    done: &str,
+    mut each: impl FnMut(&File) -> Result<bool>,
+) -> Result<(String, Option<String>)> {
+    let (mut count, mut skipped) = (0, 0);
+    for file in files {
+        match each(file) {
+            Ok(true) => count += 1,
+            Ok(false) => skipped += 1,
+            Err(e) if count > 0 => anyhow::bail!("{} {done}; {}: {e:#}", items(count), file.name),
+            Err(e) => anyhow::bail!("{}: {e:#}", file.name),
+        }
+    }
+    let mut status = format!("{} {done}", items(count));
+    if skipped > 0 {
+        status += &format!(", skipped {skipped}");
+    }
+    Ok((status, files.first().map(|f| f.id.clone())))
 }
 /// Lists a folder tree in the background; its files are queued under `dir/<folder name>`.
 fn download_folder(api: &Api, tx: &Sender<Message>, folder: File, dir: &Path) {
@@ -684,6 +625,148 @@ pub fn run(api: Api, options: Options) -> Result<()> {
     ratatui::restore();
     result
 }
+/// Handles a key while a prompt is open.
+fn prompt_key(view: &mut View, api: &Api, tx: &Sender<Message>, key: KeyEvent) {
+    let Some(input) = view.input.as_mut() else {
+        return;
+    };
+    if let Prompt::Trash(_) = input.prompt {
+        let Some(Input {
+            prompt: Prompt::Trash(files),
+            ..
+        }) = view.input.take()
+        else {
+            unreachable!()
+        };
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            view.marked.retain(|m| !files.iter().any(|f| f.id == m.id));
+            view.status = format!("Moving {} to the trash…", items(files.len()));
+            view.busy += 1;
+            operate(api, tx, move |api| {
+                each(&files, "moved to the trash", |f| {
+                    api.trash(&f.id).map(|_| true)
+                })
+            });
+        } else {
+            view.status = "Nothing moved to the trash".into();
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(Input {
+                prompt: Prompt::Filter,
+                ..
+            }) = view.input.take()
+            {
+                view.set_filter(String::new());
+            }
+        }
+        KeyCode::Enter => {
+            let input = view.input.take().unwrap();
+            let text = input.text;
+            let folder = view.folder().to_owned();
+            match input.prompt {
+                Prompt::Filter => {}
+                Prompt::Create => {
+                    let (name, dir) = match text.trim().strip_suffix('/') {
+                        Some(name) => (name.to_owned(), true),
+                        None => (text.trim().to_owned(), false),
+                    };
+                    if name.is_empty() {
+                        return;
+                    }
+                    view.busy += 1;
+                    view.status = format!("Creating {name}…");
+                    operate(api, tx, move |api| {
+                        let file = api.create(&folder, &name, dir)?;
+                        let kind = if dir { "folder" } else { "file" };
+                        Ok((format!("Created {kind} {}", file.name), Some(file.id)))
+                    });
+                }
+                Prompt::Rename(file) => {
+                    if text.trim().is_empty() || text.trim() == file.name {
+                        return;
+                    }
+                    view.busy += 1;
+                    view.status = format!("Renaming {}…", file.name);
+                    operate(api, tx, move |api| {
+                        let renamed = api.rename(&file.id, &text)?;
+                        Ok((
+                            format!("Renamed {} to {}", file.name, renamed.name),
+                            Some(renamed.id),
+                        ))
+                    });
+                }
+                Prompt::Upload => {
+                    if text.trim().is_empty() {
+                        return;
+                    }
+                    let path = local_path(&text);
+                    view.busy += 1;
+                    view.status = format!("Uploading {}…", path.display());
+                    operate(api, tx, move |api| {
+                        let file = api.upload(&path, &folder, None)?;
+                        Ok((format!("Uploaded {}", file.name), Some(file.id)))
+                    });
+                }
+                Prompt::Trash(_) => unreachable!(),
+            }
+        }
+        _ => {
+            if input.edit(key) && matches!(input.prompt, Prompt::Filter) {
+                let text = input.text.clone();
+                view.set_filter(text);
+            }
+        }
+    }
+}
+fn paste(view: &mut View, api: &Api, tx: &Sender<Message>) {
+    let Some(clipboard) = view.clipboard.take_if(|c| c.cut) else {
+        let Some(clipboard) = &view.clipboard else {
+            view.status = "Nothing to paste: y copies, x cuts".into();
+            return;
+        };
+        // Drive copies files only; folders would need a recursive copy.
+        let files: Vec<File> = clipboard
+            .files
+            .iter()
+            .filter(|f| !f.folder())
+            .cloned()
+            .collect();
+        let folders = clipboard.files.len() - files.len();
+        if files.is_empty() {
+            view.status = "Drive cannot copy folders; x then p moves them".into();
+            return;
+        }
+        let folder = view.folder().to_owned();
+        view.busy += 1;
+        view.status = format!("Copying {}…", items(files.len()));
+        operate(api, tx, move |api| {
+            let (mut status, select) =
+                each(&files, "copied", |f| api.copy(&f.id, &folder).map(|_| true))?;
+            if folders > 0 {
+                status += &format!("; folders cannot be copied ({folders} left out)");
+            }
+            Ok((status, select))
+        });
+        return;
+    };
+    let folder = view.folder().to_owned();
+    // A folder cannot move into itself.
+    if clipboard.files.iter().any(|f| f.id == folder) {
+        view.status = "Cannot move a folder into itself".into();
+        view.clipboard = Some(clipboard);
+        return;
+    }
+    view.busy += 1;
+    view.status = format!("Moving {}…", items(clipboard.files.len()));
+    operate(api, tx, move |api| {
+        each(&clipboard.files, "moved here", |f| {
+            api.move_to(&f.id, &folder)
+        })
+    });
+}
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let db = Store::open(&api.db)?;
@@ -699,28 +782,28 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
         options.connections,
     );
     fetch(&api, &tx, options.folder.clone(), false);
+    // Selected after the next listing of the current folder arrives.
+    let mut select: Option<String> = None;
     let mut changed = Instant::now();
     let result = (|| -> Result<()> {
         loop {
             while let Ok(message) = rx.try_recv() {
                 match message {
-                    Message::Folder(id, result)
-                        if view.path.last().is_some_and(|(current, _)| current == &id) =>
-                    {
+                    Message::Folder(id, result) if view.folder() == id => {
                         view.loading = false;
                         match result {
                             Ok(files) => {
-                                view.files = files;
-                                view.selection.select(if view.files.is_empty() {
-                                    None
-                                } else {
-                                    Some(0)
-                                });
-                                view.preview_id = None;
-                                view.status.clear();
+                                view.set_entries(files, select.take());
+                                if view.stale {
+                                    view.status.clear();
+                                    view.stale = false;
+                                }
                                 changed = Instant::now();
                             }
-                            Err(e) => view.status = e,
+                            Err(e) => {
+                                view.status = e;
+                                view.stale = true;
+                            }
                         }
                     }
                     Message::Preview(id, result) if view.selected().is_some_and(|f| f.id == id) => {
@@ -742,6 +825,20 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
                             }
                             Err(e) => format!("Could not list {name}: {e}"),
                         };
+                    }
+                    Message::Operated(result) => {
+                        view.busy -= 1;
+                        view.status = match result {
+                            Ok((status, id)) => {
+                                select = id;
+                                status
+                            }
+                            Err(e) => e,
+                        };
+                        view.loading = true;
+                        // Cached previews may now be out of date.
+                        view.preview_id = None;
+                        fetch(&api, &tx, view.folder().to_owned(), false);
                     }
                     Message::Finished(id, result) => {
                         if let Some(active) = view.active.take_if(|a| a.id == id) {
@@ -797,38 +894,38 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
             let Event::Key(key) = event::read()? else {
                 continue;
             };
-            if key.kind != KeyEventKind::Press {
+            if key.kind != KeyEventKind::Press || view.quitting {
                 continue;
             }
-            if view.quitting {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if view.help {
+                view.help = false;
                 continue;
             }
+            if view.input.is_some() && !(ctrl && key.code == KeyCode::Char('c')) {
+                prompt_key(&mut view, &api, &tx, key);
+                changed = Instant::now();
+                continue;
+            }
+            let before = view.selection.selected();
             match key.code {
-                KeyCode::Char('q') | KeyCode::Char('c')
-                    if key.code == KeyCode::Char('q')
-                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    view.quitting = true;
-                    view.jobs.retain(|j| j.state != State::Queued);
-                    view.status = "Stopping download…".into();
-                    if let Some(active) = &view.active {
-                        active.cancel.store(true, Ordering::Relaxed);
-                    }
-                }
+                KeyCode::Char('q') => view.quitting = true,
+                KeyCode::Char('c') if ctrl => view.quitting = true,
                 KeyCode::Char('c') => {
                     if let Some(active) = &view.active {
                         active.cancel.store(true, Ordering::Relaxed);
                         view.status = "Cancelling…".into();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    view.move_by(1);
-                    changed = Instant::now();
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    view.move_by(-1);
-                    changed = Instant::now();
-                }
+                KeyCode::Char('?') => view.help = true,
+                KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
+                KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
+                KeyCode::Char('d') if ctrl => view.move_by(view.page as isize / 2),
+                KeyCode::Char('u') if ctrl => view.move_by(-(view.page as isize) / 2),
+                KeyCode::PageDown => view.move_by(view.page as isize),
+                KeyCode::PageUp => view.move_by(-(view.page as isize)),
+                KeyCode::Home | KeyCode::Char('g') => view.move_to(0),
+                KeyCode::End | KeyCode::Char('G') => view.move_to(isize::MAX),
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     view.connections = (view.connections + 1).min(16);
                     db.set("connections", &view.connections.to_string())?;
@@ -839,40 +936,70 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     if let Some(file) = view.selected().filter(|f| f.folder()).cloned() {
-                        view.path.push((file.id.clone(), file.name));
-                        view.files = api.cached(&file.id).unwrap_or_default();
-                        view.selection.select(Some(0));
-                        view.preview.clear();
-                        view.preview_id = None;
-                        view.loading = true;
-                        fetch(&api, &tx, file.id, false);
+                        let files = api.cached(&file.id).unwrap_or_default();
+                        let id = file.id.clone();
+                        view.enter(file, files);
+                        fetch(&api, &tx, id, false);
                     }
                 }
                 KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                     if view.path.len() > 1 {
-                        view.path.pop();
-                        let id = view.path.last().unwrap().0.clone();
-                        view.files = api.cached(&id).unwrap_or_default();
-                        view.selection.select(Some(0));
-                        view.preview.clear();
-                        view.preview_id = None;
-                        view.loading = true;
+                        let id = view.path[view.path.len() - 2].0.clone();
+                        let files = api.cached(&id).unwrap_or_default();
+                        let parent = view
+                            .path
+                            .len()
+                            .checked_sub(3)
+                            .map(|i| api.cached(&view.path[i].0).unwrap_or_default())
+                            .unwrap_or_default();
+                        view.leave(files, parent);
                         fetch(&api, &tx, id, false);
                     }
                 }
-                KeyCode::Char('r') => {
+                KeyCode::Char('r') if ctrl => {
                     view.loading = true;
-                    fetch(&api, &tx, view.path.last().unwrap().0.clone(), false);
+                    fetch(&api, &tx, view.folder().to_owned(), false);
+                }
+                KeyCode::F(5) => {
+                    view.loading = true;
+                    fetch(&api, &tx, view.folder().to_owned(), false);
                 }
                 KeyCode::Char(' ') => view.toggle_mark(),
-                KeyCode::Char('a') => view.toggle_all(),
-                KeyCode::Esc => view.marked.clear(),
-                KeyCode::Char('d') => {
-                    let picked: Vec<File> = if view.marked.is_empty() {
+                KeyCode::Char('a') if ctrl => view.toggle_all(),
+                KeyCode::Esc => view.escape(),
+                KeyCode::Char('/') => {
+                    view.input = Some(Input::new(Prompt::Filter, view.filter.clone()));
+                }
+                KeyCode::Char('a') => view.input = Some(Input::new(Prompt::Create, String::new())),
+                KeyCode::Char('u') => view.input = Some(Input::new(Prompt::Upload, String::new())),
+                KeyCode::Char('r') => {
+                    if let Some(file) = view.selected().cloned() {
+                        let mut input = Input::new(Prompt::Rename(file.clone()), file.name.clone());
+                        // Start before the extension, as most renames keep it.
+                        if let Some((stem, _)) = file.name.rsplit_once('.')
+                            && !file.folder()
+                            && !stem.is_empty()
+                        {
+                            input.cursor = stem.chars().count();
+                        }
+                        view.input = Some(input);
+                    }
+                }
+                KeyCode::Char('D') | KeyCode::Delete => {
+                    let files = if view.marked.is_empty() {
                         view.selected().cloned().into_iter().collect()
                     } else {
-                        std::mem::take(&mut view.marked)
+                        view.marked.clone()
                     };
+                    if !files.is_empty() {
+                        view.input = Some(Input::new(Prompt::Trash(files), String::new()));
+                    }
+                }
+                KeyCode::Char('y') => view.yank(false),
+                KeyCode::Char('x') => view.yank(true),
+                KeyCode::Char('p') => paste(&mut view, &api, &tx),
+                KeyCode::Char('d') => {
+                    let picked = view.take_picked();
                     let (folders, files): (Vec<_>, Vec<_>) =
                         picked.into_iter().partition(|f| f.folder());
                     if !files.is_empty() || folders.is_empty() {
@@ -890,8 +1017,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
                     }
                 }
                 KeyCode::Char('R') => view.retry_failed(),
-                KeyCode::Char('x') => view.clear_queue(),
+                KeyCode::Char('X') => view.clear_queue(),
                 _ => {}
+            }
+            if view.quitting {
+                view.jobs.retain(|j| j.state != State::Queued);
+                view.status = "Stopping download…".into();
+                if let Some(active) = &view.active {
+                    active.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            if view.selection.selected() != before {
+                changed = Instant::now();
             }
         }
         Ok(())
@@ -918,6 +1055,7 @@ mod tests {
             resource_key: None,
         }
     }
+    const DIR: &str = "application/vnd.google-apps.folder";
     fn render(view: &mut View, w: u16, h: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
@@ -927,34 +1065,44 @@ mod tests {
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
     }
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
     #[test]
     fn layout_has_browser_above_downloads() {
-        let folder = file("folder", "Documents", "application/vnd.google-apps.folder");
+        let folder = file("folder", "Documents", DIR);
         let mut view = View::new(("root".into(), "My Drive".into()), vec![folder], 8);
         view.loading = false;
-        for (w, h) in [(100, 30), (40, 15)] {
+        for (w, h) in [(120, 30), (100, 30), (40, 15)] {
             let rows = render(&mut view, w, h);
-            let files = rows.iter().position(|s| s.contains("Files")).unwrap();
+            let files = rows.iter().position(|s| s.contains("Documents")).unwrap();
             let downloads = rows.iter().position(|s| s.contains("Downloads")).unwrap();
             assert!(downloads > files);
-            assert!(rows.iter().any(|s| s.contains("Documents")));
+            assert!(rows[0].contains("My Drive"));
+            assert!(rows.last().unwrap().contains("NORMAL"));
         }
+        view.help = true;
+        let rows = render(&mut view, 100, 30);
+        assert!(rows.iter().any(|s| s.contains("Move to the trash")));
     }
     #[test]
     fn marked_files_are_queued_together() {
         let files = vec![
             file("a", "a.bin", "application/octet-stream"),
-            file("dir", "dir", "application/vnd.google-apps.folder"),
+            file("dir", "dir", DIR),
             file("b", "b.bin", "application/octet-stream"),
             file("form", "Form", "application/vnd.google-apps.form"),
         ];
         let mut view = View::new(("root".into(), "My Drive".into()), files, 8);
         view.toggle_all();
-        assert_eq!(view.marked.len(), 2);
+        assert_eq!(view.marked.len(), 4);
+        view.toggle_all();
+        assert!(view.marked.is_empty());
+        view.toggle_all();
         let marked = std::mem::take(&mut view.marked);
         let (added, skipped) =
             view.enqueue(marked.into_iter().map(|f| (f, "out".into())).collect());
-        assert_eq!(queued(&added, skipped), "Queued 2 files");
+        assert_eq!(queued(&added, skipped), "Queued 2 files, skipped 2");
         let (added, skipped) = view.enqueue(vec![(view.files[0].clone(), "out".into())]);
         assert_eq!(
             (added.len(), skipped),
@@ -1004,22 +1152,21 @@ mod tests {
     }
     #[test]
     fn folders_are_walked_recursively() {
-        let dir = "application/vnd.google-apps.folder";
         let tree = |id: &str| -> Result<Vec<File>> {
             Ok(match id {
                 "root" => vec![
-                    file("sub", "Sub/Dir", dir),
+                    file("sub", "Sub/Dir", DIR),
                     file("a", "a.bin", "application/octet-stream"),
                 ],
                 // A folder reachable twice is listed once.
                 "sub" => vec![
-                    file("deep", "Deep", dir),
-                    file("again", "Deep", dir),
+                    file("deep", "Deep", DIR),
+                    file("again", "Deep", DIR),
                     file("b", "b.bin", "application/octet-stream"),
                 ],
                 "deep" | "again" => vec![
                     file("c", "c.bin", "application/octet-stream"),
-                    file("sub", "Sub/Dir", dir),
+                    file("sub", "Sub/Dir", DIR),
                 ],
                 _ => anyhow::bail!("unknown folder {id}"),
             })
@@ -1046,5 +1193,93 @@ mod tests {
         let mut view = View::new(("root".into(), "My Drive".into()), vec![], 8);
         let (added, skipped) = view.enqueue(files);
         assert_eq!((added.len(), skipped), (3, 1));
+    }
+    #[test]
+    fn filter_keeps_selection_and_navigation_restores_it() {
+        let files = vec![
+            file("p", "Photos", DIR),
+            file("r", "report.pdf", "application/pdf"),
+            file("n", "notes.txt", "text/plain"),
+        ];
+        let mut view = View::new(("root".into(), "My Drive".into()), files.clone(), 8);
+        view.set_filter("RE".into());
+        assert_eq!(view.files.len(), 1);
+        assert_eq!(view.selected().unwrap().id, "r");
+        view.escape();
+        assert_eq!(view.files.len(), 3);
+        // A refresh keeps the selected file even when its position changes.
+        view.move_to(2);
+        let mut reordered = files.clone();
+        reordered.reverse();
+        view.set_entries(reordered, None);
+        assert_eq!(view.selected().unwrap().id, "n");
+        view.move_to(2);
+        view.enter(files[0].clone(), vec![file("x", "x.jpg", "image/jpeg")]);
+        assert_eq!(view.parent.len(), 3);
+        assert_eq!(view.folder(), "p");
+        let rows = render(&mut view, 120, 30);
+        assert!(rows[0].contains("My Drive") && rows[0].contains("Photos"));
+        view.leave(files, vec![]);
+        assert_eq!(view.selected().unwrap().id, "p");
+    }
+    #[test]
+    fn yank_uses_marks_and_escape_steps_back() {
+        let files = vec![
+            file("a", "a.bin", "application/octet-stream"),
+            file("b", "b.bin", "application/octet-stream"),
+        ];
+        let mut view = View::new(("root".into(), "My Drive".into()), files, 8);
+        view.yank(false);
+        assert_eq!(view.clipboard.as_ref().unwrap().files[0].id, "a");
+        view.toggle_all();
+        view.yank(true);
+        let clipboard = view.clipboard.as_ref().unwrap();
+        assert!(clipboard.cut && clipboard.files.len() == 2);
+        assert!(view.marked.is_empty());
+        let rows = render(&mut view, 100, 30);
+        assert!(rows.last().unwrap().contains("2 cut"));
+        view.escape();
+        assert!(view.clipboard.is_none());
+    }
+    #[test]
+    fn input_edits_by_character() {
+        let mut input = Input::new(Prompt::Create, "héllo.txt".into());
+        input.cursor = 5;
+        input.edit(key(KeyCode::Char('!')));
+        assert_eq!(input.text, "héllo!.txt");
+        input.edit(key(KeyCode::Backspace));
+        input.edit(key(KeyCode::Backspace));
+        assert_eq!(input.text, "héll.txt");
+        input.edit(key(KeyCode::Home));
+        input.edit(key(KeyCode::Delete));
+        assert_eq!(input.text, "éll.txt");
+        assert!(!input.edit(key(KeyCode::Enter)));
+        input.edit(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(input.text.is_empty() && input.cursor == 0);
+    }
+    #[test]
+    fn local_paths_accept_terminal_drops() {
+        assert_eq!(local_path(" 'a b.zip' "), PathBuf::from("a b.zip"));
+        assert_eq!(local_path("a\\ b.zip"), PathBuf::from("a b.zip"));
+        assert_eq!(local_path("~/x"), dirs::home_dir().unwrap().join("x"));
+    }
+    #[test]
+    fn batch_operations_report_progress() {
+        let files = [
+            file("a", "a", "text/plain"),
+            file("b", "b", "text/plain"),
+            file("c", "c", "text/plain"),
+        ];
+        let (status, select) = each(&files, "moved here", |f| Ok(f.id != "b")).unwrap();
+        assert_eq!(status, "2 items moved here, skipped 1");
+        assert_eq!(select.as_deref(), Some("a"));
+        let error = each(&files, "copied", |f| {
+            if f.id == "c" {
+                anyhow::bail!("quota")
+            }
+            Ok(true)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "2 items copied; c: quota");
     }
 }

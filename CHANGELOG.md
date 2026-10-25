@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- File operations in `browse`, with yazi-style keys: `a` creates a file or (with a trailing `/`) a folder, `r` renames, `y`/`x` copy or cut and `p` pastes into the current folder, `D` moves items to the Drive trash after a confirmation, and `u` uploads a local file into the current folder.
+- `/` filters the current folder by name; `g/G`, `Ctrl-d/Ctrl-u` and PgUp/PgDn move faster; `?` shows every key.
+- A redesigned `browse`: parent, current folder and preview columns, files coloured by type, a breadcrumb header and a status bar with the mode, position, marks and clipboard.
+
+### Changed
+
+- `browse` keys that now belong to file operations moved: mark all is `Ctrl-a` (was `a`), refresh is `Ctrl-r`/F5 (was `r`), and removing queued downloads is `X` (was `x`).
+- Mark all also marks folders, and any item can be marked.
+
 ## 0.3.0
 
 ### Added

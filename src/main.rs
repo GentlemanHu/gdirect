@@ -77,7 +77,7 @@ enum Commands {
     },
     /// Remove saved credentials from SQLite; scanned IPs are kept
     Logout,
-    /// Browse folders; j/k navigate, Enter open, d download, +/- connections
+    /// Browse and manage folders; ? lists the keys (d download, a create, r rename, D trash)
     Browse {
         /// Folder ID to open
         #[arg(default_value = "root")]

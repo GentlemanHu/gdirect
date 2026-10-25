@@ -74,20 +74,31 @@ gdirect upload ./file.zip
 gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
 ```
 
+`browse` shows the parent folder, the current folder and a preview side by side, like [yazi](https://github.com/sxyazi/yazi). Press `?` for every key.
+
 | Key in `browse` | Action |
 | --- | --- |
 | `j/k`, `↑/↓` | Select |
+| `g/G`, Home/End | First / last item |
+| `Ctrl-d/Ctrl-u`, PgDn/PgUp | Half a page / a page down or up |
 | Enter, `l/→` | Open folder |
 | `h/←`, Backspace | Parent folder |
-| Space | Mark or unmark a file or folder. Marks are kept when you change folders |
-| `a` | Mark all files in this folder (press again to unmark) |
-| Esc | Clear all marks |
+| `/` | Filter the current folder by name. Enter keeps the filter, Esc clears it |
+| `Ctrl-r`, F5 | Refresh |
+| Space | Mark or unmark an item. Marks are kept when you change folders |
+| `Ctrl-a` | Mark everything shown (press again to unmark) |
+| Esc | Clear the filter, then the marks, then the clipboard |
+| `a` | Create an empty file; a name ending in `/` creates a folder |
+| `r` | Rename |
+| `y` / `x` | Copy / cut the marked items, or the selected one |
+| `p` | Paste into the current folder. Cut items are moved; copied files are duplicated (Drive cannot copy folders) |
+| `D`, Delete | Move the marked items, or the selected one, to the Drive trash (asks first) |
+| `u` | Upload a local file into the current folder |
 | `d` | Queue the marked items, or the selected one. A folder is downloaded with all its subfolders into `<output>/<folder name>/`. Google Docs/Sheets/Slides are exported as PDF |
 | `+/-` | Connections for the next download (1–16), saved as your default |
-| `r` | Refresh |
 | `c` | Cancel the current download and keep the partial data |
 | `R` | Retry failed or cancelled downloads |
-| `x` | Remove downloads that have not started yet |
+| `X` | Remove downloads that have not started yet |
 | `q` | Quit |
 
 - **Queue:** downloads run one at a time. The file list shows each file's state (◦ queued, ↓ downloading, ✓ saved, ✗ failed), and the Downloads panel shows overall progress. Select a failed file to see the full error. Files with the same name in one session are saved as `name (2).ext`.
