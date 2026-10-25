@@ -6,18 +6,26 @@
 #include <string>
 
 // One synchronous session per call. No C++ exception crosses the C ABI.
+// libaria2 is initialised once per process and never deinitialised: aria2's
+// Platform::tearDown() frees the global option registry without resetting it,
+// so a second libraryInit()/sessionNew() would read freed memory and crash.
+// Callers serialise sessions (download::SESSION), so the flag needs no atomics.
+static int library_state = 0;  // 0 = not yet, 1 = ready, -1 = failed
+static bool library_ready() {
+  if (library_state == 0) library_state = aria2::libraryInit() == 0 ? 1 : -1;
+  return library_state == 1;
+}
+
 using ProgressCallback = int (*)(int64_t, int64_t, int, int, void*);
 extern "C" int gdirect_download_ex(const char* url, const char* dir, const char* name,
                                 const char* ip, const char* sni, const char* token,
                                 const char* ca, int connections, ProgressCallback callback, void* data, bool signals) noexcept {
   aria2::Session* session = nullptr;
-  bool initialized = false;
   int result = -1;
   try {
     gdirect_ip = ip;
     gdirect_sni = sni;
-    if (aria2::libraryInit() != 0) return -1;
-    initialized = true;
+    if (!library_ready()) { gdirect_ip = gdirect_sni = nullptr; return -1; }
     aria2::KeyVals opts = {
       {"dir", dir}, {"out", name}, {"continue", "true"},
       {"auto-file-renaming", "false"}, {"allow-overwrite", "false"},
@@ -73,7 +81,6 @@ extern "C" int gdirect_download_ex(const char* url, const char* dir, const char*
     result = -1;
     if (session) { try { aria2::sessionFinal(session); } catch (...) {} }
   }
-  if (initialized) { try { aria2::libraryDeinit(); } catch (...) { result = -1; } }
   gdirect_ip = gdirect_sni = nullptr;
   if (!callback) std::fprintf(stderr, "\n");
   return result;
