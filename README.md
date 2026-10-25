@@ -9,15 +9,26 @@ gdirect browses, downloads, uploads and mounts your Google Drive from the termin
 | Traffic | Route |
 | --- | --- |
 | Drive API, downloads, uploads (`browse`, `ls`, `download`, `upload`) | A scanned Google IP. The hostname and certificate check stay the same. If connections carrying the real SNI are reset, gdirect automatically retries under a forged identity (`g.cn` as TLS name, the real host in the Host header) — same idea as Sheas-Cealer — and remembers what worked per IP |
-| Sign-in and token refresh (`oauth2.googleapis.com`) | Your normal system network (DNS, proxy) |
+| Sign-in, account verification and token refresh (`accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com`) | Your normal system network (DNS, proxy) |
 | `mount` (rclone) | Your normal system network |
 
 The first transfer command checks a known relay and sweeps Google's own front ends, and keeps the ones that work for 24 hours. The relay, 183.56.143.147, is not Google: it forwards connections to Google, which makes it fast and stable in mainland China, so it is tried first. It cannot read your traffic (TLS runs end to end and is verified against Google's roots), but its operator sees your IP address and, unless the forged identity is used, which Google host you connect to. To avoid it, pass `--google-only` (or set `GDIRECT_GOOGLE_ONLY=1`); only Google's own front ends are then used. Those come from the address space Google publishes as its own ([goog.json minus cloud.json](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges), embedded and refreshed weekly). Most Google IPs are blocked in mainland China, but some front ends are not: the sweep tries a TCP connection first, fully verifies only what answers (TLS, the Drive API and a test download), and stops once it has 8. Each candidate is probed with the real SNI first, then with the forged identity. If an endpoint (the relay included) stops answering, requests and downloads move to the next verified one. `login` and `mount` do not scan. Certificates are verified against Google's own GTS roots (embedded in the binary), never against a system CA bundle — a compromised third-party CA cannot impersonate Google for gdirect.
 
 Network requirements:
 
-- Sign-in and token refresh must reach `oauth2.googleapis.com` through your system network. If Google is blocked, you still need a proxy or VPN for this.
+- Sign-in needs browser access to `accounts.google.com` and application access to `oauth2.googleapis.com` and `www.googleapis.com`. Token refresh needs `oauth2.googleapis.com`. If Google is blocked, keep a proxy available for these requests, including during transfers.
 - If you use a TUN-mode proxy or VPN (for example Clash/Mihomo TUN), route Google's IP ranges **DIRECT** and turn off fake-ip for them. A TUN proxy accepts every connection, so otherwise the scan measures the proxy instead of your network; `scan` warns when it sees this. `gdirect scan --list` shows the IPs in use.
+
+### System proxy without TUN
+
+- On macOS and Windows, sign-in, account verification and token refresh use the manual HTTP/HTTPS system proxy. A proxy client in rule mode with TUN off is enough: proxy `accounts.google.com`, `oauth2.googleapis.com` and `www.googleapis.com`. No DIRECT rules are needed; scans, Drive API requests, uploads and downloads still connect to the scanned endpoints directly.
+- If you turn TUN on with domain sniffing, a `www.googleapis.com` proxy rule also catches those transfers. Exclude the scanned IPs from sniffing.
+- On Linux, or with PAC, set `HTTPS_PROXY` for each command (your client's HTTP or mixed port). `HTTP_PROXY` / `HTTPS_PROXY` take precedence over system settings, and `mount` passes them on to rclone. `NO_PROXY` must not exclude the Google endpoints above.
+
+```sh
+HTTPS_PROXY=http://127.0.0.1:7890 gdirect login --client-secret ~/Downloads/client_secret.json
+HTTPS_PROXY=http://127.0.0.1:7890 gdirect mount
+```
 
 ## Install
 

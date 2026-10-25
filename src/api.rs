@@ -64,12 +64,14 @@ impl File {
 }
 fn client_for(ip: Option<IpAddr>, forged: Option<&str>) -> Result<Client> {
     let mut builder = client_builder()
-        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(30));
     if let Some(ip) = ip {
-        builder = builder.resolve(forged.unwrap_or(API_HOST), SocketAddr::new(ip, 443));
+        // Only pinned transfers bypass proxies; login verifies the account without a pin.
+        builder = builder
+            .no_proxy()
+            .resolve(forged.unwrap_or(API_HOST), SocketAddr::new(ip, 443));
     }
     Ok(builder.build()?)
 }
@@ -249,12 +251,16 @@ impl Api {
         Ok(token.access_token)
     }
     fn account_for_token(&self, token: &str) -> Result<String> {
-        let response = self.deliver(|client, forged| {
-            client
-                .get(url_for(forged, "about"))
-                .query(&[("fields", "user(emailAddress)")])
-                .bearer_auth(token)
-        })?;
+        let response = self
+            .deliver(|client, forged| {
+                client
+                    .get(url_for(forged, "about"))
+                    .query(&[("fields", "user(emailAddress)")])
+                    .bearer_auth(token)
+            })
+            .context(
+                "cannot verify the account; check system HTTP/HTTPS proxy settings or HTTPS_PROXY and access to www.googleapis.com",
+            )?;
         let data = checked(response)?;
         Ok(data["user"]["emailAddress"]
             .as_str()
@@ -520,6 +526,30 @@ pub fn destination(dir: &Path, file: &File) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn login_client_uses_proxy() {
+        crate::test_network::assert_route("api::tests::login_client_uses_proxy", true, |url| {
+            Ok(client_for(None, None)?
+                .get(url)
+                .send()?
+                .error_for_status()?
+                .json()?)
+        });
+    }
+    #[test]
+    fn pinned_client_bypasses_proxy() {
+        crate::test_network::assert_route(
+            "api::tests::pinned_client_bypasses_proxy",
+            false,
+            |url| {
+                Ok(client_for(Some("127.0.0.1".parse()?), None)?
+                    .get(url)
+                    .send()?
+                    .error_for_status()?
+                    .json()?)
+            },
+        );
+    }
     #[test]
     fn drive_errors_keep_status_and_hint_only_for_scope() {
         use reqwest::StatusCode;
