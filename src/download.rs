@@ -288,9 +288,19 @@ fn matches_md5(path: &Path, expected: Option<&str>) -> Result<bool> {
     Ok(file_md5(path)?.eq_ignore_ascii_case(expected))
 }
 
+// Verification anchors Google's own GTS roots only (see api::GTS_PEM): a
+// generic CA bundle would keep trusting a compromised CA like the leaked
+// eMudhra intermediates, letting an on-path attacker mint Google
+// certificates and tamper with downloads.
 fn bundled_ca() -> Option<PathBuf> {
-    let path = std::env::current_exe().ok()?.parent()?.join("cacert.pem");
-    path.is_file().then_some(path)
+    let dir = dirs::data_local_dir()?.join("gdirect");
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("gts-roots.pem");
+    match fs::read(&path) {
+        Ok(existing) if existing == crate::api::GTS_PEM.as_bytes() => {}
+        _ => fs::write(&path, crate::api::GTS_PEM).ok()?,
+    }
+    Some(path)
 }
 
 #[cfg(test)]

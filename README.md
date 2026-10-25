@@ -49,7 +49,7 @@ brew install rclone   # only for mount; Linux also needs your distro's fuse3 pac
 
 Upgrade with `brew update && brew upgrade gdirect`, or by rerunning the installer.
 
-You can also download a [release archive](https://github.com/mizorewww/gdirect/releases/latest). Keep `cacert.pem` next to the executable, because downloads use it to verify certificates.
+You can also download a [release archive](https://github.com/mizorewww/gdirect/releases/latest). Certificates are verified against Google's own GTS roots, which are embedded in the binary — no CA bundle file is needed.
 
 ## One-time Google setup (about 10 minutes)
 
@@ -113,7 +113,7 @@ Advanced transfer options for `download` and `browse` (`ls` and `upload` accept 
 | --- | --- |
 | `--ip IP` | Use this Google IP instead of the scanned one |
 | `--sni HOST` / `--no-sni` | Send a different TLS SNI, or none. Certificates are still checked against the real hostname |
-| `--ca-cert FILE` | Use this CA bundle instead of the bundled `cacert.pem` |
+| `--ca-cert FILE` | Use this CA bundle instead of the embedded Google GTS roots |
 | `--export MIME` | (`download`) Export a Google Docs file, for example `application/pdf` |
 
 Run `gdirect scan` to scan again and `gdirect scan --list` to see the results, including the last error for each IP. To test your own candidates, run `gdirect scan --ips FILE`. The file holds one public IP per line, and `#` starts a comment.

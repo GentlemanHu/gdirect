@@ -36,10 +36,10 @@ def main():
             shutil.copy2(ROOT / document, folder / document)
         if (ROOT / 'docs/configuration').is_dir():
             shutil.copytree(ROOT / 'docs/configuration', folder / 'docs/configuration')
+        # No CA bundle ships: Google endpoints are verified against Google's
+        # own GTS roots, which are embedded in the binary.
         for url, destination in [
-            ('https://curl.se/ca/cacert.pem', 'cacert.pem'),
             ('https://raw.githubusercontent.com/openssl/openssl/openssl-3.0.0/LICENSE.txt', 'OPENSSL-LICENSE.txt'),
-            ('https://www.mozilla.org/media/MPL/2.0/index.txt', 'CA-LICENSE.txt'),
         ]:
             with urllib.request.urlopen(url, timeout=60) as response:
                 (folder / destination).write_bytes(response.read())
@@ -57,7 +57,7 @@ def main():
             archive = dist / f'{name}.tar.gz'
             with tarfile.open(archive, 'w:gz') as output:
                 output.add(folder, arcname=name)
-        # Smoke test the packaged layout, including the adjacent trust store.
+        # Smoke test the packaged layout.
         output = subprocess.check_output([str(folder / binary), '--version'], text=True).strip()
         assert output == f'gdirect {version}', output
     digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()

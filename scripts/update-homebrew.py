@@ -45,7 +45,7 @@ class Gdirect < Formula
   end
 
   def install
-    libexec.install "gdirect", "cacert.pem"
+    libexec.install "gdirect"
     bin.write_exec_script libexec/"gdirect"
     doc.install "README.md", "README.zh-CN.md", "BUILD-INFO.json"
     doc.install "docs" if File.directory?("docs")
@@ -65,7 +65,6 @@ class Gdirect < Formula
   test do
     assert_match version.to_s, shell_output("#{{bin}}/gdirect --version")
     assert_match "upload", shell_output("#{{bin}}/gdirect --help")
-    assert_path_exists libexec/"cacert.pem"
   end
 end
 '''

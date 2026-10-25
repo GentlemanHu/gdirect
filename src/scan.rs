@@ -1,6 +1,5 @@
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
-use reqwest::blocking::Client;
 use std::{
     collections::BTreeSet,
     io::Read,
@@ -76,7 +75,7 @@ fn candidates(db: &Store, path: Option<&Path>) -> Result<Vec<IpAddr>> {
 }
 // A missing or changed public test file is reported as a warning, not as a dead IP.
 fn probe(ip: IpAddr) -> Result<(i64, Option<String>)> {
-    let client = Client::builder()
+    let client = crate::api::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))

@@ -36,7 +36,7 @@ struct Transfer {
     /// Send no TLS SNI; the certificate is still verified
     #[arg(long, conflicts_with = "sni")]
     no_sni: bool,
-    /// CA bundle for certificate verification (default: cacert.pem beside the executable)
+    /// CA bundle for certificate verification (default: bundled Google GTS roots)
     #[arg(long)]
     ca_cert: Option<PathBuf>,
     /// Connections per download, 1-16 (default: value saved in browse, else 8)

@@ -59,7 +59,7 @@ brew install rclone   # 仅挂载需要；Linux 还要用发行版的包管理�
 
 升级可以执行 `brew update && brew upgrade gdirect`，也可以重新运行安装脚本。
 
-也可以直接下载 [Release 安装包](https://github.com/mizorewww/gdirect/releases/latest)。解压后请把 `cacert.pem` 和可执行文件放在同一个目录，下载时要用它校验证书。
+也可以直接下载 [Release 安装包](https://github.com/mizorewww/gdirect/releases/latest)。证书校验内置了 Google 自己的 GTS 根证书，无需另外放置 CA 文件。
 
 ## 一次性配置 Google（约 10 分钟）
 
@@ -123,7 +123,7 @@ gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
 | --- | --- |
 | `--ip IP` | 指定 Google IP，不使用扫描结果 |
 | `--sni HOST` / `--no-sni` | 发送其他 TLS SNI，或不发送 SNI。证书仍按真实主机名校验 |
-| `--ca-cert FILE` | 用指定的 CA 证书包代替自带的 `cacert.pem` |
+| `--ca-cert FILE` | 用指定的 CA 证书包代替内置的 Google GTS 根证书 |
 | `--export MIME` | （`download`）导出 Google 文档，例如 `application/pdf` |
 
 `gdirect scan` 会重新扫描，`gdirect scan --list` 查看扫描结果，其中包括每个 IP 最近一次的错误。要测试自己找到的候选 IP，可以执行 `gdirect scan --ips FILE`：文件中每行写一个公网 IP，`#` 后面是注释。

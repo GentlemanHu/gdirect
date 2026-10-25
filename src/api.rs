@@ -9,6 +9,30 @@ use std::{
 };
 
 const FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,resourceKey";
+pub(crate) const API_HOST: &str = "www.googleapis.com";
+/// TLS identity used when a censor resets the real SNI: connect and verify
+/// as g.cn (a Google name this edge serves a matching certificate for) while
+/// the HTTP Host header still names the real Google host.
+pub(crate) const FORGED_HOST: &str = "g.cn";
+/// Google issues every endpoint we touch under its own Google Trust Services
+/// roots. Anchoring verification there (instead of a full CA bundle) means a
+/// compromised or mis-issuing third-party CA cannot impersonate Google for
+/// this client, even with a publicly leaked intermediate key.
+pub(crate) const GTS_PEM: &str = include_str!("gts-roots.pem");
+pub(crate) fn client_builder() -> reqwest::blocking::ClientBuilder {
+    let mut builder = Client::builder().tls_built_in_root_certs(false);
+    for pem in GTS_PEM.split("-----END CERTIFICATE-----") {
+        let pem = pem.trim();
+        if pem.is_empty() {
+            continue;
+        }
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(format!("{pem}-----END CERTIFICATE-----").as_bytes())
+                .expect("bundled GTS root must parse"),
+        );
+    }
+    builder
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct File {
@@ -44,13 +68,13 @@ pub struct Api {
 }
 impl Api {
     pub fn new(db: PathBuf, ip: Option<IpAddr>) -> Result<Self> {
-        let mut builder = Client::builder()
+        let mut builder = client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(30));
         if let Some(ip) = ip {
-            builder = builder.resolve("www.googleapis.com", SocketAddr::new(ip, 443));
+            builder = builder.resolve(API_HOST, SocketAddr::new(ip, 443));
         }
         Ok(Self {
             client: builder.build()?,

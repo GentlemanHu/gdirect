@@ -28,7 +28,6 @@ with tempfile.TemporaryDirectory(prefix='gdirect installer ') as temporary:
     subprocess.run(command, check=True)
     assert subprocess.check_output([prefix/'bin/gdirect', '--version'], text=True).strip() == f'gdirect {version}'
     assert 'client-secret' in subprocess.check_output([prefix/'bin/gdirect', 'login', '--help'], text=True)
-    assert (prefix/f'libexec/gdirect/{version}/cacert.pem').is_file()
     assert (prefix/f'libexec/gdirect/{version}/docs/configuration/README.md').is_file()
     if args.with_mount:
         rclone = prefix/'bin/rclone'
@@ -40,4 +39,4 @@ with tempfile.TemporaryDirectory(prefix='gdirect installer ') as temporary:
         '--from-dir', str(artifacts), '--prefix', str(bad_prefix)], capture_output=True, text=True)
     assert result.returncode != 0 and 'Checksum mismatch' in result.stderr
     assert not (bad_prefix/'bin/gdirect').exists()
-print('Installer package, paths, bundled CA/docs and checksum rejection passed')
+print('Installer package, paths, docs and checksum rejection passed')

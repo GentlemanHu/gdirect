@@ -71,7 +71,7 @@ pub struct Token {
     pub expires_in: i64,
 }
 fn http() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+    Ok(crate::api::client_builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::none())
