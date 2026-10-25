@@ -79,12 +79,18 @@ gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
 | `j/k`, `↑/↓` | Select |
 | Enter, `l/→` | Open folder |
 | `h/←`, Backspace | Parent folder |
-| `d` | Queue download. Google Docs/Sheets/Slides are exported as PDF |
+| Space | Mark or unmark a file or folder. Marks are kept when you change folders |
+| `a` | Mark all files in this folder (press again to unmark) |
+| Esc | Clear all marks |
+| `d` | Queue the marked items, or the selected one. A folder is downloaded with all its subfolders into `<output>/<folder name>/`. Google Docs/Sheets/Slides are exported as PDF |
 | `+/-` | Connections for the next download (1–16), saved as your default |
 | `r` | Refresh |
 | `c` | Cancel the current download and keep the partial data |
+| `R` | Retry failed or cancelled downloads |
+| `x` | Remove downloads that have not started yet |
 | `q` | Quit |
 
+- **Queue:** downloads run one at a time. The file list shows each file's state (◦ queued, ↓ downloading, ✓ saved, ✗ failed), and the Downloads panel shows overall progress. Select a failed file to see the full error. Files with the same name in one session are saved as `name (2).ext`.
 - **Resume:** if a download or upload is interrupted, run the same command again.
 - **Downloads** that already finished are recognised by their checksum and reported as already downloaded. Files are checked against Drive's MD5 after the download.
 - **Uploads** always create a new file. They never overwrite a file with the same name.
