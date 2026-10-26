@@ -72,9 +72,9 @@ impl Api {
         ensure!(!name.is_empty(), "file name cannot be empty");
         ensure!(crate::drive::valid_id(parent), "invalid parent folder ID");
         let db = Store::open(&self.db)?;
-        let key = format!(
-            "upload:{}",
-            serde_json::to_string(&(path.to_string_lossy(), parent, name))?
+        let key = Store::upload_key(
+            self.account.as_deref().unwrap_or_default(),
+            &serde_json::to_string(&(path.to_string_lossy(), parent, name))?,
         );
         let saved = db
             .setting(&key)?

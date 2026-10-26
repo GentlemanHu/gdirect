@@ -57,8 +57,8 @@ impl Credentials {
         }
     }
 }
-pub fn credentials(db: &Store) -> Result<Credentials> {
-    if let Some(raw) = db.setting("oauth_credentials")? {
+pub fn credentials(db: &Store, account: Option<&str>) -> Result<Credentials> {
+    if let Some(raw) = account.map(|a| db.credentials(a)).transpose()?.flatten() {
         return Credentials::parse(raw.as_bytes());
     }
     bail!(
@@ -129,6 +129,7 @@ pub fn refresh(credentials: &Credentials) -> Result<Token> {
 }
 pub fn prepare_login(
     db: &Store,
+    account: Option<&str>,
     client: Option<&Path>,
     import: Option<&Path>,
     reauth: bool,
@@ -148,13 +149,14 @@ pub fn prepare_login(
         return browser_login(&client);
     }
     if reauth {
+        // Any signed-in account's client works for adding another account.
         let client = match db.setting("oauth_client")? {
             Some(raw) => serde_json::from_str(&raw)?,
-            None => credentials(db)?.client(),
+            None => credentials(db, account.or(db.default_account()?.as_deref()))?.client(),
         };
         return browser_login(&client);
     }
-    credentials(db)
+    credentials(db, account)
 }
 fn random_string() -> Result<String> {
     let mut bytes = [0; 32];

@@ -19,6 +19,9 @@ struct Cli {
     /// Local SQLite state file (default: platform data directory)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Signed-in account to use: an address or an unambiguous prefix (default: see gdirect accounts)
+    #[arg(short = 'a', long, global = true, env = "GDIRECT_ACCOUNT")]
+    account: Option<String>,
 }
 #[derive(Args, Clone, Default)]
 struct Route {
@@ -66,10 +69,11 @@ enum Commands {
         #[arg(long)]
         list: bool,
     },
-    /// Sign in with a Google Desktop OAuth client JSON
+    /// Sign in with a Google Desktop OAuth client JSON; signing in again adds another account
     Login {
-        /// Sign in again in the browser using the saved OAuth client
-        #[arg(long)]
+        /// Sign in in the browser using the saved OAuth client; the account you
+        /// choose there is added (or renewed) and becomes the default
+        #[arg(long, visible_alias = "add")]
         reauth: bool,
         /// Google Desktop OAuth client JSON (opens browser)
         #[arg(long, conflicts_with = "credentials")]
@@ -78,8 +82,21 @@ enum Commands {
         #[arg(long, conflicts_with = "reauth")]
         credentials: Option<PathBuf>,
     },
-    /// Remove saved credentials from SQLite; scanned IPs are kept
-    Logout,
+    /// Remove an account's saved credentials (default: the default account); scanned IPs are kept
+    Logout {
+        /// Account to sign out: an address or an unambiguous prefix
+        account: Option<String>,
+        /// Sign out every account
+        #[arg(long, conflicts_with = "account")]
+        all: bool,
+    },
+    /// List signed-in accounts; * marks the default
+    Accounts,
+    /// Make another signed-in account the default
+    Switch {
+        /// Address or unambiguous prefix
+        account: String,
+    },
     /// Browse and manage folders; ? lists the keys (d download, a create, r rename, D trash)
     Browse {
         /// Folder ID to open
@@ -116,7 +133,7 @@ enum Commands {
         #[arg(short = 'j', long, value_parser = clap::value_parser!(u8).range(1..=16))]
         connections: Option<u8>,
     },
-    /// Unmount this database's background mount
+    /// Unmount a background mount (default: the default account's, or the only one)
     Unmount,
     /// Upload a local file (repeat the command to resume)
     Upload {
@@ -163,6 +180,8 @@ fn direct_route(db: &store::Store, route: &Route) -> Result<(IpAddr, Option<Stri
 fn run(cli: Cli) -> Result<()> {
     let db_path = cli.db.clone().map(Ok).unwrap_or_else(store::default_path)?;
     let db = store::Store::open(&db_path)?;
+    // Commands that work without a login resolve the account lazily.
+    let account = || db.resolve_account(cli.account.as_deref());
     let saved = || -> u8 {
         db.setting("connections")
             .ok()
@@ -189,15 +208,45 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Scan { ips, .. } => {
             scan::run(&db, ips.as_deref())?;
         }
-        Commands::Unmount => mount::unmount(&db)?,
-        Commands::Logout => logout(&db)?,
+        Commands::Unmount => {
+            let asked = match cli.account.as_deref() {
+                Some(_) => account()?,
+                None => None,
+            };
+            mount::unmount(&db, asked.as_deref())?
+        }
+        Commands::Logout { account: name, all } => {
+            logout(&db, all, name.as_deref().or(cli.account.as_deref()))?
+        }
+        Commands::Accounts => {
+            let default = db.default_account()?;
+            let accounts = db.accounts()?;
+            if accounts.is_empty() {
+                println!("No account signed in; run gdirect login");
+            }
+            for email in accounts {
+                let mark = if Some(&email) == default.as_ref() {
+                    '*'
+                } else {
+                    ' '
+                };
+                println!("{mark} {email}");
+            }
+        }
+        Commands::Switch { account: name } => {
+            let email = db
+                .resolve_account(Some(&name))?
+                .context("no account signed in; run gdirect login")?;
+            db.set_default_account(&email)?;
+            println!("Default account: {email}");
+        }
         Commands::Mount {
             path,
             read_only,
             foreground,
             connections,
         } => {
-            let api = api::Api::new(db_path, None, None, false)?;
+            let api = api::Api::new(db_path, account()?, None, None, false)?;
             let connections = connections.unwrap_or_else(saved);
             mount::run(&api, path.as_deref(), read_only, foreground, connections)?;
         }
@@ -206,11 +255,20 @@ fn run(cli: Cli) -> Result<()> {
             client_secret,
             credentials,
         } => {
-            let api = api::Api::new(db_path, None, None, false)?;
+            // The very first login has no account to pick yet.
+            let current = if db.accounts()?.is_empty() {
+                None
+            } else {
+                account()?
+            };
+            let api = api::Api::new(db_path, current, None, None, false)?;
             let email = api.login(reauth, client_secret.as_deref(), credentials.as_deref())?;
-            println!("Logged in: {email}\nSQLite: {}", api.db.display());
+            println!(
+                "Logged in: {email} (default account)\nSQLite: {}",
+                api.db.display()
+            );
             if !reauth && client_secret.is_none() && credentials.is_none() {
-                println!("To switch accounts: gdirect login --reauth");
+                println!("To add another account: gdirect login --add");
             }
         }
         Commands::Ls {
@@ -218,8 +276,9 @@ fn run(cli: Cli) -> Result<()> {
             json,
             route,
         } => {
+            let account = account()?;
             let (ip, sni, auto) = direct_route(&db, &route)?;
-            let api = api::Api::new(db_path, Some(ip), sni, auto)?;
+            let api = api::Api::new(db_path, account, Some(ip), sni, auto)?;
             let files = api.list(&folder)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&files)?);
@@ -241,8 +300,9 @@ fn run(cli: Cli) -> Result<()> {
             name,
             route,
         } => {
+            let account = account()?;
             let (ip, sni, auto) = direct_route(&db, &route)?;
-            let api = api::Api::new(db_path, Some(ip), sni, auto)?;
+            let api = api::Api::new(db_path, account, Some(ip), sni, auto)?;
             let uploaded = api.upload(&file, &parent, name.as_deref())?;
             println!("{}\t{}", uploaded.id, uploaded.name);
         }
@@ -252,8 +312,9 @@ fn run(cli: Cli) -> Result<()> {
             export,
             transfer,
         } => {
+            let account = account()?;
             let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
-            let api = api::Api::new(db_path, Some(ip), sni.clone(), auto)?;
+            let api = api::Api::new(db_path, account, Some(ip), sni.clone(), auto)?;
             let connections = transfer.connections.unwrap_or_else(saved);
             start_download(
                 &api,
@@ -272,8 +333,9 @@ fn run(cli: Cli) -> Result<()> {
             output,
             transfer,
         } => {
+            let account = account()?;
             let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
-            let api = api::Api::new(db_path, Some(ip), sni.clone(), auto)?;
+            let api = api::Api::new(db_path, account, Some(ip), sni.clone(), auto)?;
             let options = tui::Options {
                 folder,
                 output,
@@ -288,16 +350,36 @@ fn run(cli: Cli) -> Result<()> {
     }
     Ok(())
 }
-fn logout(db: &store::Store) -> Result<()> {
-    anyhow::ensure!(
-        db.setting("mount")?.is_none(),
-        "a background mount is recorded; run gdirect unmount first"
-    );
-    match db.clear_auth()? {
-        Some(account) => println!(
-            "Logged out {account}: removed saved credentials, OAuth client, access token and upload sessions. Scanned IPs are kept."
-        ),
-        None => println!("No saved login; nothing removed."),
+fn logout(db: &store::Store, all: bool, name: Option<&str>) -> Result<()> {
+    let accounts = if all {
+        db.accounts()?
+    } else {
+        db.resolve_account(name)?.into_iter().collect()
+    };
+    if accounts.is_empty() {
+        println!("No saved login; nothing removed.");
+        return Ok(());
+    }
+    for account in &accounts {
+        anyhow::ensure!(
+            db.setting(&store::Store::mount_key(account))?.is_none(),
+            "{account} has a background mount; run gdirect unmount --account {account} first"
+        );
+    }
+    for account in &accounts {
+        db.remove_account(account)?;
+        println!(
+            "Logged out {account}: removed saved credentials, access token and upload sessions."
+        );
+    }
+    match db.default_account()? {
+        Some(next) => {
+            db.set_default_account(&next)?;
+            println!("Default account: {next}");
+        }
+        None => {
+            println!("No account left; the saved OAuth client was removed. Scanned IPs are kept.")
+        }
     }
     Ok(())
 }
@@ -313,8 +395,7 @@ fn start_download(
     transfer: &Transfer,
     connections: u8,
 ) -> Result<()> {
-    let db = store::Store::open(&api.db)?;
-    let token = if db.account()?.is_some() || std::env::var_os("GDIRECT_ACCESS_TOKEN").is_some() {
+    let token = if api.account.is_some() || std::env::var_os("GDIRECT_ACCESS_TOKEN").is_some() {
         Some(api.download_token()?)
     } else {
         None
@@ -400,8 +481,16 @@ mod tests {
         assert!(parse(&["mount", "-j", "4"]).is_ok());
         assert!(matches!(
             parse(&["logout"]).unwrap().command,
-            Some(Commands::Logout)
+            Some(Commands::Logout {
+                account: None,
+                all: false
+            })
         ));
+        assert!(parse(&["logout", "a@example.com", "--all"]).is_err());
+        assert!(parse(&["login", "--add"]).is_ok());
+        let cli = parse(&["ls", "-a", "work"]).unwrap();
+        assert_eq!(cli.account.as_deref(), Some("work"));
+        assert!(parse(&["switch"]).is_err());
         assert!(parse(&["download", "id", "--sni", "g.cn", "--no-sni"]).is_err());
         let cli = parse(&["download", "id", "--no-sni", "--ip", "1.1.1.1", "-o", "f"]).unwrap();
         let Some(Commands::Download { transfer, .. }) = cli.command else {

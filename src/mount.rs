@@ -64,12 +64,13 @@ pub fn run(
     }
 
     let db = Store::open(&api.db)?;
+    let account = api.account.clone().context("run gdirect login first")?;
+    let key = Store::mount_key(&account);
     ensure!(
-        db.setting("mount")?.is_none(),
-        "a mount is already recorded; run gdirect unmount first"
+        db.setting(&key)?.is_none(),
+        "{account} is already mounted; run gdirect unmount --account {account} first"
     );
-    let account = db.account()?.context("run gdirect login first")?;
-    let credentials_data = crate::auth::credentials(&db)?;
+    let credentials_data = crate::auth::credentials(&db, Some(&account))?;
     // Fail here rather than inside rclone if the saved login no longer works.
     crate::auth::refresh(&credentials_data)?;
     let email = account.as_str();
@@ -198,10 +199,10 @@ pub fn run(
         pid: child.id(),
         config,
     };
-    db.set("mount", &serde_json::to_string(&mounted)?)?;
+    db.set(&key, &serde_json::to_string(&mounted)?)?;
     for _ in 0..60 {
         if let Some(status) = child.try_wait()? {
-            db.unset("mount")?;
+            db.unset(&key)?;
             let _ = fs::remove_file(&credentials);
             anyhow::bail!("rclone mount exited ({status}); see {}", log.display());
         }
@@ -215,7 +216,7 @@ pub fn run(
     child.wait()?;
     // Keep the record if the OS mounted at the timeout boundary.
     if !is_mounted(&mounted.path)? {
-        db.unset("mount")?;
+        db.unset(&key)?;
         let _ = fs::remove_file(&credentials);
     }
     anyhow::bail!(
@@ -234,10 +235,33 @@ fn is_mounted(path: &Path) -> Result<bool> {
         .lines()
         .any(|line| line.contains(&marker)))
 }
-pub fn unmount(db: &Store) -> Result<()> {
-    let raw = db
-        .setting("mount")?
-        .context("no background mount recorded; foreground mounts stop with Ctrl-C")?;
+/// The account whose mount `unmount` detaches: the one asked for, else the
+/// default account's mount, else the only mount recorded.
+fn mounted_account(db: &Store, asked: Option<&str>) -> Result<String> {
+    if let Some(account) = asked {
+        return Ok(account.to_owned());
+    }
+    let mounted = db.mounted_accounts()?;
+    if let Some(default) = db.default_account()?
+        && mounted.contains(&default)
+    {
+        return Ok(default);
+    }
+    match mounted.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no background mount recorded; foreground mounts stop with Ctrl-C"),
+        many => anyhow::bail!(
+            "several accounts are mounted ({}); choose one with --account",
+            many.join(", ")
+        ),
+    }
+}
+pub fn unmount(db: &Store, account: Option<&str>) -> Result<()> {
+    let account = mounted_account(db, account)?;
+    let key = Store::mount_key(&account);
+    let raw = db.setting(&key)?.with_context(|| {
+        format!("no background mount recorded for {account}; foreground mounts stop with Ctrl-C")
+    })?;
     let mounted: Mounted = serde_json::from_str(&raw)?;
     if is_mounted(&mounted.path)? {
         let status = if cfg!(target_os = "macos") {
@@ -271,7 +295,7 @@ pub fn unmount(db: &Store) -> Result<()> {
             ensure!(status.success(), "could not stop mount process");
         }
     }
-    db.unset("mount")?;
+    db.unset(&key)?;
     // rclone was given a copy of the refresh credential; do not leave it behind.
     let _ = fs::remove_file(mounted.config.with_file_name("credentials.json"));
     println!(

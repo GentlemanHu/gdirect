@@ -209,7 +209,18 @@ impl View {
         if !self.filter.is_empty() {
             spans.push(format!("  /{}", self.filter).yellow());
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let breadcrumb = Line::from(spans);
+        // The account sits on the right while it fits beside the breadcrumb.
+        if let Some(account) = &self.account {
+            let room = (area.width as usize).saturating_sub(breadcrumb.width() + 2);
+            if account.width() < room {
+                frame.render_widget(
+                    Paragraph::new(format!("{account} ").fg(DIM)).alignment(Alignment::Right),
+                    area,
+                );
+            }
+        }
+        frame.render_widget(Paragraph::new(breadcrumb), area);
     }
     fn draw_browser(&mut self, frame: &mut Frame, area: Rect) {
         let mut title = vec![" ".into()];

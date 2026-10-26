@@ -92,6 +92,8 @@ struct Live {
 #[derive(Clone)]
 pub struct Api {
     pub db: PathBuf,
+    /// The signed-in account this client acts as; None before the first login.
+    pub account: Option<String>,
     ip: Option<IpAddr>,
     /// False once the user picks --sni/--no-sni explicitly: no quiet fallback.
     auto: bool,
@@ -100,6 +102,7 @@ pub struct Api {
 impl Api {
     pub fn new(
         db: PathBuf,
+        account: Option<String>,
         ip: Option<IpAddr>,
         forged: Option<String>,
         auto: bool,
@@ -114,6 +117,7 @@ impl Api {
                 forged,
             })),
             db,
+            account,
             ip,
             auto,
         })
@@ -163,7 +167,13 @@ impl Api {
             return validate_token(token);
         }
         let db = Store::open(&self.db)?;
-        if let Some(token) = db.token()? {
+        if let Some(token) = self
+            .account
+            .as_deref()
+            .map(|a| db.token(a))
+            .transpose()?
+            .flatten()
+        {
             return Ok(token);
         }
         self.refresh()
@@ -176,14 +186,12 @@ impl Api {
     }
     fn refresh(&self) -> Result<String> {
         let db = Store::open(&self.db)?;
-        let credentials = crate::auth::credentials(&db)?;
+        // The account is verified at login; refreshing its credentials cannot change it.
+        let credentials = crate::auth::credentials(&db, self.account.as_deref())?;
         let token = crate::auth::refresh(&credentials)?;
-        // The account is verified at login; refreshing the same credentials cannot change it.
-        let email = match db.account()? {
-            Some(account) => account,
-            None => self.account_for_token(&token.access_token)?,
-        };
-        db.save_auth(&email, &token.access_token, token.expires_in)?;
+        if let Some(account) = &self.account {
+            db.save_token(account, &token.access_token, token.expires_in)?;
+        }
         Ok(token.access_token)
     }
     fn account_for_token(&self, token: &str) -> Result<String> {
@@ -206,17 +214,20 @@ impl Api {
         import: Option<&Path>,
     ) -> Result<String> {
         let db = Store::open(&self.db)?;
-        let credentials = crate::auth::prepare_login(&db, client, import, reauth)?;
+        let credentials =
+            crate::auth::prepare_login(&db, self.account.as_deref(), client, import, reauth)?;
         let token = crate::auth::refresh(&credentials)?;
+        // Whichever account was chosen in the browser is added (or updated) and becomes the default.
         let email = self.account_for_token(&token.access_token)?;
-        db.set("oauth_credentials", &serde_json::to_string(&credentials)?)?;
+        db.save_account(&email, &serde_json::to_string(&credentials)?)?;
         if client.is_some() {
             db.set(
                 "oauth_client",
                 &serde_json::to_string(&credentials.client())?,
             )?;
         }
-        db.save_auth(&email, &token.access_token, token.expires_in)?;
+        db.save_token(&email, &token.access_token, token.expires_in)?;
+        db.set_default_account(&email)?;
         Ok(email)
     }
     fn get(&self, path: &str, query: &[(String, String)]) -> Result<serde_json::Value> {
@@ -359,7 +370,11 @@ impl Api {
                 break;
             }
         }
-        Store::open(&self.db)?.cache(folder, &serde_json::to_string(&files)?)?;
+        Store::open(&self.db)?.cache(
+            self.account.as_deref().unwrap_or_default(),
+            folder,
+            &serde_json::to_string(&files)?,
+        )?;
         Ok(files)
     }
     pub fn metadata(&self, id: &str) -> Result<File> {
@@ -375,7 +390,7 @@ impl Api {
     }
     pub fn cached(&self, folder: &str) -> Result<Vec<File>> {
         Store::open(&self.db)?
-            .cached(folder)?
+            .cached(self.account.as_deref().unwrap_or_default(), folder)?
             .map(|json| serde_json::from_str(&json).map_err(Into::into))
             .unwrap_or_else(|| Ok(Vec::new()))
     }

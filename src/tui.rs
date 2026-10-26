@@ -161,6 +161,8 @@ struct View {
     /// Folder downloads still being listed.
     listing: usize,
     quitting: bool,
+    /// The signed-in account being browsed, shown in the header.
+    account: Option<String>,
 }
 impl View {
     fn new(path: (String, String), files: Vec<File>, connections: u8) -> Self {
@@ -188,6 +190,7 @@ impl View {
             active: None,
             listing: 0,
             quitting: false,
+            account: None,
         };
         view.set_entries(files, None);
         view
@@ -784,6 +787,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, options: Option
         initial,
         options.connections,
     );
+    view.account = api.account.clone();
     fetch(&api, &tx, options.folder.clone(), false);
     // Selected after the next listing of the current folder arrives.
     let mut select: Option<String> = None;
