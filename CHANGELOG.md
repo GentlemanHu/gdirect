@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `scan` now sweeps Google's own front ends instead of starting from a hard-coded seed. That seed, 183.56.143.147, turned out to be a third-party reverse proxy (Google saw its Hong Kong exit), and it is purged from existing databases. Candidates come only from Google's published address space (goog.json minus cloud.json), embedded and refreshed weekly; poisoned DNS answers outside it are ignored. The sweep checks TCP first, fully verifies what answers, tries the rest of a working /24 next and stops at 8 verified endpoints. In a test from China Unicom (Shanghai) it found genuine Google front ends serving Drive directly at 4–6 MB/s per connection.
+- Requests and downloads fail over to the next verified endpoint when the current one stops answering; downloads resume the partial file there.
+
+### Added
+
+- `scan` and `scan --list` mark endpoints outside Google's address space as `[third-party relay]`, and `scan` warns when a TUN proxy appears to be accepting every connection.
+
+### Fixed
+
+- `download --no-sni` and `browse --no-sni` no longer fail at start.
+
 ## 0.6.0
 
 ### Added

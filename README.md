@@ -12,12 +12,12 @@ gdirect browses, downloads, uploads and mounts your Google Drive from the termin
 | Sign-in and token refresh (`oauth2.googleapis.com`) | Your normal system network (DNS, proxy) |
 | `mount` (rclone) | Your normal system network |
 
-The first transfer command scans candidate IPs automatically and keeps the fastest working one for 24 hours. `login` and `mount` do not scan. Each candidate is probed with the real SNI first, then with the forged identity, so the stored route always reflects what actually connects. Certificates are verified against Google's own GTS roots (embedded in the binary), never against a system CA bundle — a compromised third-party CA cannot impersonate Google for gdirect.
+The first transfer command sweeps Google's own front ends and keeps the ones that work for 24 hours. Candidates come only from the address space Google publishes as its own ([goog.json minus cloud.json](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges), embedded and refreshed weekly), so traffic goes to Google itself, never to a third-party relay. Most Google IPs are blocked in mainland China, but some front ends are not: the sweep tries a TCP connection first, fully verifies only what answers (TLS, the Drive API and a test download), and stops once it has 8. Each candidate is probed with the real SNI first, then with the forged identity. If an endpoint stops answering, requests and downloads move to the next verified one. `login` and `mount` do not scan. Certificates are verified against Google's own GTS roots (embedded in the binary), never against a system CA bundle — a compromised third-party CA cannot impersonate Google for gdirect.
 
 Network requirements:
 
 - Sign-in and token refresh must reach `oauth2.googleapis.com` through your system network. If Google is blocked, you still need a proxy or VPN for this.
-- If you use a TUN-mode proxy or VPN (for example Clash/Mihomo TUN), route the scanned Google IPs **DIRECT** and turn off fake-ip for them. Otherwise gdirect's traffic is captured again and the scan finds nothing. `gdirect scan --list` shows the IPs.
+- If you use a TUN-mode proxy or VPN (for example Clash/Mihomo TUN), route Google's IP ranges **DIRECT** and turn off fake-ip for them. A TUN proxy accepts every connection, so otherwise the scan measures the proxy instead of your network; `scan` warns when it sees this. `gdirect scan --list` shows the IPs in use.
 
 ## Install
 
@@ -116,7 +116,7 @@ Advanced route options (`download` and `browse` take all of them; `ls` and `uplo
 | `--ca-cert FILE` | Use this CA bundle instead of the embedded Google GTS roots |
 | `--export MIME` | (`download`) Export a Google Docs file, for example `application/pdf` |
 
-Run `gdirect scan` to scan again and `gdirect scan --list` to see the results, including the last error for each IP. To test your own candidates, run `gdirect scan --ips FILE`. The file holds one public IP per line, and `#` starts a comment.
+Run `gdirect scan` to scan again and `gdirect scan --list` to see the results, including the last error for each IP. To test your own candidates, run `gdirect scan --ips FILE`. The file holds one public IP per line, and `#` starts a comment. Candidates outside Google's address space are accepted there but listed as `[third-party relay]`: such a server cannot read your traffic (certificates are still verified against Google's roots), but it sees your IP address and, unless the forged identity is used, which Google host you connect to.
 
 For scripts, `GDIRECT_ACCESS_TOKEN` can supply an access token instead of a login (`mount` still needs `gdirect login`).
 
