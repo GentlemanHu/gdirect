@@ -12,7 +12,7 @@ gdirect 是一个在终端里浏览、下载、上传和挂载 Google 云盘的�
 | 登录与刷新令牌（`oauth2.googleapis.com`） | 系统网络（系统 DNS、代理） |
 | `mount`（rclone） | 系统网络 |
 
-第一次运行传输类命令时，会扫描 Google 自己的前端服务器，并在 24 小时内沿用能用的那些。候选地址只来自 Google 公布为自有的 IP 段（[goog.json 减去 cloud.json](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges)，内置一份并每周更新），所以流量只会到 Google 本身，不会经过第三方中转。在中国大陆，大部分 Google IP 被封，但仍有一部分前端可以直连：扫描先试 TCP 连接，只对能连上的做完整验证（TLS、Drive API 和测试下载），找到 8 个就停止。每个候选 IP 先用真实 SNI 探测，失败再试伪造身份。某个 IP 失效时，请求和下载会自动换到下一个已验证的 IP。`login` 和 `mount` 不扫描。证书只按内置的 Google GTS 根校验，不信任系统 CA 包——第三方 CA 被攻破也无法对 gdirect 冒充 Google。
+第一次运行传输类命令时，会检查一个已知的中转节点，并扫描 Google 自己的前端服务器，在 24 小时内沿用能用的那些。这个中转节点 183.56.143.147 不是 Google 的服务器，它把连接转发给 Google；在中国大陆它又快又稳，所以排在第一个尝试。它读不到你的流量（TLS 端到端加密，证书按 Google 根证书校验），但运营者能看到你的 IP，以及在不用伪造身份时你访问的是哪个 Google 主机。不想经过它，可以加 `--google-only`（或设置 `GDIRECT_GOOGLE_ONLY=1`），这样只用 Google 自己的前端。这些前端的地址来自 Google 公布为自有的 IP 段（[goog.json 减去 cloud.json](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges)，内置一份并每周更新）。在中国大陆，大部分 Google IP 被封，但仍有一部分前端可以直连：扫描先试 TCP 连接，只对能连上的做完整验证（TLS、Drive API 和测试下载），找到 8 个就停止。每个候选 IP 先用真实 SNI 探测，失败再试伪造身份。某个 IP（包括中转节点）失效时，请求和下载会自动换到下一个已验证的 IP。`login` 和 `mount` 不扫描。证书只按内置的 Google GTS 根校验，不信任系统 CA 包——第三方 CA 被攻破也无法对 gdirect 冒充 Google。
 
 网络要求：
 

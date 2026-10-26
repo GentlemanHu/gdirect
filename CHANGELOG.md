@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The known relay 183.56.143.147 is used again, and first: it is not Google, but it is fast and stable in mainland China, and TLS through it is still verified end to end against Google's roots. When it fails, requests and downloads fall back to the verified Google front ends, which `scan` still collects. The 0.7.0 purge of it from databases is gone.
+
+### Added
+
+- `--google-only` (or `GDIRECT_GOOGLE_ONLY=1`) skips third-party relays: `scan` does not probe them and transfers use only endpoints inside Google's address space.
+
 ## 0.7.0
 
 ### Changed
