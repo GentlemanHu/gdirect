@@ -9,11 +9,11 @@ class Gdirect < Formula
     depends_on macos: :sequoia
     on_arm do
       url "https://github.com/mizorewww/gdirect/releases/download/v0.5.0/gdirect-0.5.0-aarch64-apple-darwin.tar.gz"
-      sha256 "e01a169500d0b08ad81b759d47dfd9083fa5fc76fb82d209fc639bc399b365e6"
+      sha256 "92befed8117951fc5001586c28d35cb2827f6040f74efeacc1ed8e1d052876b8"
     end
     on_intel do
       url "https://github.com/mizorewww/gdirect/releases/download/v0.5.0/gdirect-0.5.0-x86_64-apple-darwin.tar.gz"
-      sha256 "dd13157874e89be2fac95827f8d6576762a3737a67191bddb85f0c7de6c65978"
+      sha256 "f8a675088db25a700daba4e417d99dbeb78525fc8602b7c74228e63644aded41"
     end
   end
 
@@ -21,7 +21,7 @@ class Gdirect < Formula
     depends_on arch: :x86_64
     on_intel do
       url "https://github.com/mizorewww/gdirect/releases/download/v0.5.0/gdirect-0.5.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "9f78ed1e0f15ea69a3c7e2fa2df9653b5578b0461369a2ea156b0050d2430804"
+      sha256 "30952a2c158bd08cd635214cea9a8a06acad8e9a3ef639bcfd968b9c855edec3"
     end
   end
 
