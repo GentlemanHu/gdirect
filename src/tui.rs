@@ -11,7 +11,6 @@ use ratatui::widgets::ListState;
 use std::{
     collections::{HashSet, VecDeque},
     io::IsTerminal,
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,8 +24,8 @@ use std::{
 pub struct Options {
     pub folder: String,
     pub output: PathBuf,
-    pub ip: Option<IpAddr>,
-    pub sni: Option<String>,
+    /// --no-sni: downloads send no SNI (Drive API requests keep the real name).
+    pub no_sni: bool,
     pub auto: bool,
     pub connections: u8,
     pub ca_cert: Option<PathBuf>,
@@ -577,12 +576,19 @@ fn start(api: &Api, options: &Options, tx: &Sender<Message>, job: &Job, connecti
     let api = api.clone();
     let tx = tx.clone();
     let id = job.file.id.clone();
+    // The API client may already have failed over; downloads follow it.
+    let (ip, sni, backups) = api.route();
     let mut args = download::Args {
         file: id.clone(),
         output: job.output.clone(),
-        ip: options.ip,
-        sni: options.sni.clone(),
+        ip,
+        sni: if options.no_sni {
+            Some(String::new())
+        } else {
+            sni
+        },
         auto: options.auto,
+        backups,
         db: Some(api.db.clone()),
         token: None,
         export: job.file.workspace().then(|| "application/pdf".into()),

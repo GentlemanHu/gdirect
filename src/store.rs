@@ -135,6 +135,25 @@ impl Store {
         })
         .transpose()
     }
+    /// Every endpoint verified in the last day, fastest first.
+    pub fn routes(&self, limit: usize) -> Result<Vec<Route>> {
+        let mut query = self.conn.prepare(
+            "SELECT ip,sni FROM endpoints WHERE available=1 AND verified_at>? ORDER BY latency_ms LIMIT ?",
+        )?;
+        let rows = query
+            .query_map(params![now() - 86400, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(ip, sni)| {
+                Ok(Route {
+                    ip: ip.parse()?,
+                    sni,
+                })
+            })
+            .collect()
+    }
     pub fn endpoints(&self) -> Result<Vec<Endpoint>> {
         let mut query = self.conn.prepare(
             "SELECT ip,latency_ms,error,sni FROM endpoints ORDER BY available DESC,latency_ms",
@@ -391,9 +410,11 @@ mod tests {
         let route = db.best_route().unwrap().unwrap();
         assert_eq!(route.ip.to_string(), "183.56.143.147");
         assert_eq!(route.sni, "g.cn");
+        assert_eq!(db.routes(8).unwrap().len(), 2);
         db.endpoint("183.56.143.147", None, Some("timeout"), "")
             .unwrap();
         assert_eq!(db.best_route().unwrap().unwrap().ip.to_string(), "8.8.8.8");
+        assert_eq!(db.routes(8).unwrap().len(), 1);
         db.conn
             .execute("UPDATE endpoints SET verified_at=0", [])
             .unwrap();

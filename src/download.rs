@@ -24,6 +24,9 @@ pub struct Args {
     /// Retry once under the other TLS identity when the connection fails
     /// (only when the user did not pick --sni/--no-sni explicitly).
     pub auto: bool,
+    /// Other verified endpoints (with their stored identity) to resume on
+    /// when this one fails at the transport level.
+    pub backups: Vec<crate::api::Endpoint>,
     /// State database used to mark a dead endpoint after both identities fail.
     pub db: Option<PathBuf>,
     pub token: Option<String>,
@@ -183,7 +186,7 @@ fn aria2_error(code: i32) -> &'static str {
     }
 }
 
-pub fn run(args: Args, progress: Option<&mut Progress>) -> Result<()> {
+pub fn run(mut args: Args, progress: Option<&mut Progress>) -> Result<()> {
     let file = drive::FileRef::parse(&args.file)?;
     if let Some(sni) = &args.sni {
         ensure!(
@@ -237,12 +240,36 @@ pub fn run(args: Args, progress: Option<&mut Progress>) -> Result<()> {
             sni.as_deref(),
             progress.as_deref_mut(),
         )?;
-        if code != 0 && args.auto && !tried_alt && transport(code) {
-            tried_alt = true;
-            sni = match &sni {
-                Some(_) => None,
-                None => Some(crate::api::FORGED_HOST.to_owned()),
-            };
+        loop {
+            if code != 0 && args.auto && !tried_alt && transport(code) {
+                tried_alt = true;
+                sni = match &sni {
+                    Some(_) => None,
+                    None => Some(crate::api::FORGED_HOST.to_owned()),
+                };
+                code = download(
+                    &args,
+                    &url,
+                    token.as_deref(),
+                    sni.as_deref(),
+                    progress.as_deref_mut(),
+                )?;
+            }
+            if code == 0 || !transport(code) || args.backups.is_empty() {
+                break;
+            }
+            // This endpoint is gone: resume the partial file on the next one.
+            mark_dead(&args);
+            let (ip, stored) = args.backups.remove(0);
+            if progress.is_none() {
+                eprintln!(
+                    "Endpoint {} failed; resuming via {ip}",
+                    args.ip.map(|i| i.to_string()).unwrap_or_default()
+                );
+            }
+            args.ip = Some(ip);
+            sni = if args.auto { stored } else { args.sni.clone() };
+            tried_alt = false;
             code = download(
                 &args,
                 &url,

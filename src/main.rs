@@ -163,20 +163,51 @@ enum Commands {
         transfer: Transfer,
     },
 }
-/// Effective route: endpoint, TLS identity (None = real hostname) and whether
-/// an automatic identity fallback is allowed on transport failure.
-fn direct_route(db: &store::Store, route: &Route) -> Result<(IpAddr, Option<String>, bool)> {
+/// Effective route: endpoint, TLS identity (None = real hostname), whether
+/// an automatic identity fallback is allowed on transport failure, and the
+/// other verified endpoints to fail over to.
+struct Direct {
+    ip: IpAddr,
+    sni: Option<String>,
+    auto: bool,
+    backups: Vec<api::Endpoint>,
+}
+impl Direct {
+    fn api(&self, db: PathBuf, account: Option<String>) -> Result<api::Api> {
+        // --no-sni is download-only; Drive API requests keep the real name.
+        let sni = self.sni.clone().filter(|s| !s.is_empty());
+        Ok(api::Api::new(db, account, Some(self.ip), sni, self.auto)?
+            .with_backups(self.backups.clone()))
+    }
+}
+fn direct_route(db: &store::Store, route: &Route) -> Result<Direct> {
     let explicit = route.sni();
     let auto = explicit.is_none();
     if let Some(ip) = route.ip {
-        return Ok((ip, explicit, auto));
+        return Ok(Direct {
+            ip,
+            sni: explicit,
+            auto,
+            backups: Vec::new(),
+        });
     }
     let scanned = match db.best_route()? {
         Some(route) => route,
         None => scan::run(db, None)?,
     };
-    let stored = (!scanned.sni.is_empty()).then_some(scanned.sni);
-    Ok((scanned.ip, explicit.or(stored), auto))
+    let identity = |sni: String| (!sni.is_empty()).then_some(sni);
+    let backups = db
+        .routes(8)?
+        .into_iter()
+        .filter(|r| r.ip != scanned.ip)
+        .map(|r| (r.ip, identity(r.sni)))
+        .collect();
+    Ok(Direct {
+        ip: scanned.ip,
+        sni: explicit.or(identity(scanned.sni)),
+        auto,
+        backups,
+    })
 }
 fn run(cli: Cli) -> Result<()> {
     let db_path = cli.db.clone().map(Ok).unwrap_or_else(store::default_path)?;
@@ -288,8 +319,7 @@ fn run(cli: Cli) -> Result<()> {
             route,
         } => {
             let account = account()?;
-            let (ip, sni, auto) = direct_route(&db, &route)?;
-            let api = api::Api::new(db_path, account, Some(ip), sni, auto)?;
+            let api = direct_route(&db, &route)?.api(db_path, account)?;
             let files = api.list(&folder)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&files)?);
@@ -312,8 +342,7 @@ fn run(cli: Cli) -> Result<()> {
             route,
         } => {
             let account = account()?;
-            let (ip, sni, auto) = direct_route(&db, &route)?;
-            let api = api::Api::new(db_path, account, Some(ip), sni, auto)?;
+            let api = direct_route(&db, &route)?.api(db_path, account)?;
             let uploaded = api.upload(&file, &parent, name.as_deref())?;
             println!("{}\t{}", uploaded.id, uploaded.name);
         }
@@ -324,20 +353,9 @@ fn run(cli: Cli) -> Result<()> {
             transfer,
         } => {
             let account = account()?;
-            let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
-            let api = api::Api::new(db_path, account, Some(ip), sni.clone(), auto)?;
+            let api = direct_route(&db, &transfer.route)?.api(db_path, account)?;
             let connections = transfer.connections.unwrap_or_else(saved);
-            start_download(
-                &api,
-                file,
-                output,
-                export,
-                ip,
-                sni,
-                auto,
-                &transfer,
-                connections,
-            )?;
+            start_download(&api, file, output, export, &transfer, connections)?;
         }
         Commands::Browse {
             folder,
@@ -345,14 +363,12 @@ fn run(cli: Cli) -> Result<()> {
             transfer,
         } => {
             let account = account()?;
-            let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
-            let api = api::Api::new(db_path, account, Some(ip), sni.clone(), auto)?;
+            let api = direct_route(&db, &transfer.route)?.api(db_path, account)?;
             let options = tui::Options {
                 folder,
                 output,
-                ip: Some(ip),
-                sni,
-                auto,
+                no_sni: transfer.route.no_sni,
+                auto: transfer.route.sni().is_none(),
                 connections: transfer.connections.unwrap_or_else(saved),
                 ca_cert: transfer.ca_cert,
             };
@@ -394,15 +410,11 @@ fn logout(db: &store::Store, all: bool, name: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-#[allow(clippy::too_many_arguments)]
 fn start_download(
     api: &api::Api,
     file: String,
     output: Option<PathBuf>,
     export: Option<String>,
-    ip: IpAddr,
-    sni: Option<String>,
-    auto: bool,
     transfer: &Transfer,
     connections: u8,
 ) -> Result<()> {
@@ -439,13 +451,20 @@ fn start_download(
                 .map(|meta| api::destination(std::path::Path::new("downloads"), meta))
         })
         .context("public download requires -o FILE")?;
+    // Read after the metadata request, which may already have failed over.
+    let (ip, sni, backups) = api.route();
     download::run(
         download::Args {
             file,
             output,
-            ip: Some(ip),
-            sni,
-            auto,
+            ip,
+            sni: if transfer.route.no_sni {
+                Some(String::new())
+            } else {
+                sni
+            },
+            auto: transfer.route.sni().is_none(),
+            backups,
             db: Some(api.db.clone()),
             md5: metadata
                 .as_ref()
