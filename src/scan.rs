@@ -29,6 +29,29 @@ const OFFSETS: [u8; 7] = [100, 113, 155, 132, 138, 91, 123];
 /// rest of Google's space.
 const CORE: &str = "142.250.0.0/15 172.217.0.0/16 172.253.0.0/16 173.194.0.0/16 74.125.0.0/16 192.178.0.0/15 64.233.160.0/19 66.102.0.0/20 108.177.0.0/17 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19 108.170.192.0/18 72.14.192.0/18";
 const SEEDS: &str = include_str!("frontend-seeds.txt");
+/// Known third-party relays that forward to Google. Not Google: the operator
+/// sees client IPs and, without the forged identity, the hostname, but TLS
+/// stays end to end and is verified against Google's roots. They are fast and
+/// stable in mainland China, so they are tried first unless --google-only.
+const RELAYS: [&str; 1] = ["183.56.143.147"];
+fn relay(ip: IpAddr) -> bool {
+    RELAYS.iter().any(|r| r.parse() == Ok(ip))
+}
+/// Endpoints in the order transfers should use them: known relays first
+/// (unless `google_only`, which drops everything outside Google's space),
+/// then the rest as given (fastest first).
+pub fn usable(
+    routes: Vec<crate::store::Route>,
+    google: &Ranges,
+    google_only: bool,
+) -> Vec<crate::store::Route> {
+    let mut routes: Vec<_> = routes
+        .into_iter()
+        .filter(|r| !google_only || google.contains(r.ip))
+        .collect();
+    routes.sort_by_key(|r| !relay(r.ip));
+    routes
+}
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -283,7 +306,7 @@ fn record(
     }
     Ok(good)
 }
-pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
+pub fn run(db: &Store, path: Option<&Path>, google_only: bool) -> Result<()> {
     let google = crate::ranges::current(db);
     let mut warned = false;
     if let Some(path) = path {
@@ -310,6 +333,17 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
             .flatten()
             .map(|a| a.ip())
             .collect();
+        if !google_only {
+            let relays: Vec<IpAddr> = RELAYS.iter().filter_map(|r| r.parse().ok()).collect();
+            eprintln!("Checking known relays (not Google; use --google-only to skip)…");
+            record(
+                db,
+                &google,
+                verify(&relays, usize::MAX),
+                |_| true,
+                &mut warned,
+            )?;
+        }
         let mut queue = plan(&google, &known, &dns, &mut Shuffle::new());
         let mut tried: HashSet<IpAddr> = HashSet::new();
         let mut reached: HashSet<IpAddr> = HashSet::new();
@@ -358,11 +392,12 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
             db.endpoint(&ip.to_string(), None, Some("no TCP answer"), "")?;
         }
     }
-    let route = db.best_route()?.context(
-        "no usable Google front end found; route Google IPs DIRECT if you use a TUN proxy, or provide candidates with gdirect scan --ips FILE",
-    )?;
-    eprintln!("Selected a verified endpoint; saved in SQLite.");
-    Ok(route)
+    ensure!(
+        !usable(db.routes(LIMIT)?, &google, google_only).is_empty(),
+        "no usable Google front end found; route Google IPs DIRECT if you use a TUN proxy, or provide candidates with gdirect scan --ips FILE"
+    );
+    eprintln!("Verified endpoints saved in SQLite.");
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -414,6 +449,38 @@ mod tests {
                 ![187, 207, 219].contains(&v4.octets()[3]) || known.contains(a) || dns.contains(a),
             _ => true,
         }));
+    }
+    #[test]
+    fn relays_go_first_unless_google_only() {
+        let google = crate::ranges::embedded();
+        let route = |ip: &str| crate::store::Route {
+            ip: ip.parse().unwrap(),
+            sni: String::new(),
+        };
+        let ips = |routes: Vec<crate::store::Route>| -> Vec<String> {
+            routes.iter().map(|r| r.ip.to_string()).collect()
+        };
+        let routes = || {
+            vec![
+                route("142.250.27.100"),
+                route("1.2.3.4"),
+                route("183.56.143.147"),
+                route("192.179.60.132"),
+            ]
+        };
+        assert_eq!(
+            ips(usable(routes(), &google, false)),
+            [
+                "183.56.143.147",
+                "142.250.27.100",
+                "1.2.3.4",
+                "192.179.60.132"
+            ]
+        );
+        assert_eq!(
+            ips(usable(routes(), &google, true)),
+            ["142.250.27.100", "192.179.60.132"]
+        );
     }
     #[test]
     fn shuffle_is_a_permutation() {

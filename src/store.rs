@@ -72,12 +72,6 @@ impl Store {
                 CREATE TABLE folders(account TEXT NOT NULL,id TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(account,id));")?;
         }
         migrate_single_account(&conn)?;
-        // Releases up to 0.6 seeded scans with 183.56.143.147, which turned out
-        // to be a third-party relay rather than Google; forget it once.
-        conn.execute_batch(
-            "DELETE FROM endpoints WHERE ip='183.56.143.147' AND NOT EXISTS(SELECT 1 FROM settings WHERE key='relay_seed_purged');
-            INSERT OR IGNORE INTO settings VALUES('relay_seed_purged','1');",
-        )?;
         // Added later: which TLS identity worked. Older databases gain it here.
         if !columns(&conn, "endpoints")?.iter().any(|c| c == "sni") {
             conn.execute_batch("ALTER TABLE endpoints ADD COLUMN sni TEXT NOT NULL DEFAULT ''")?;
@@ -445,21 +439,6 @@ mod tests {
         let db = Store::open(&path).unwrap();
         db.endpoint("8.8.8.8", Some(10), None, "g.cn").unwrap();
         assert_eq!(db.best_route().unwrap().unwrap().sni, "g.cn");
-        // The old relay seed is purged once; adding it again by hand sticks.
-        db.endpoint("183.56.143.147", Some(5), None, "").unwrap();
-        drop(db);
-        let db = Store::open(&path).unwrap();
-        assert_eq!(
-            db.best_route().unwrap().unwrap().ip.to_string(),
-            "183.56.143.147"
-        );
-        drop(db);
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("DELETE FROM settings WHERE key='relay_seed_purged'", [])
-            .unwrap();
-        drop(conn);
-        let db = Store::open(&path).unwrap();
-        assert_eq!(db.best_route().unwrap().unwrap().ip.to_string(), "8.8.8.8");
         drop(db);
         let _ = std::fs::remove_file(path);
     }
