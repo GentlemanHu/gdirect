@@ -12,6 +12,7 @@ use std::{
 
 const FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,resourceKey";
 pub(crate) const API_HOST: &str = "www.googleapis.com";
+pub(crate) const TOKEN_HOST: &str = "oauth2.googleapis.com";
 /// TLS identity used when a censor resets the real SNI: connect and verify
 /// as g.cn (a Google name this edge serves a matching certificate for) while
 /// the HTTP Host header still names the real Google host.
@@ -62,7 +63,7 @@ impl File {
             )
     }
 }
-fn client_for(ip: Option<IpAddr>, forged: Option<&str>) -> Result<Client> {
+fn client_for(ip: Option<IpAddr>, forged: Option<&str>, host: &str) -> Result<Client> {
     let mut builder = client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(8))
@@ -71,13 +72,13 @@ fn client_for(ip: Option<IpAddr>, forged: Option<&str>) -> Result<Client> {
         // Only pinned transfers bypass proxies; login verifies the account without a pin.
         builder = builder
             .no_proxy()
-            .resolve(forged.unwrap_or(API_HOST), SocketAddr::new(ip, 443));
+            .resolve(forged.unwrap_or(host), SocketAddr::new(ip, 443));
     }
     Ok(builder.build()?)
 }
-/// Request URL for `path` under the current TLS identity.
+/// Request URL for `path` (e.g. "drive/v3/about") under the current TLS identity.
 pub(crate) fn url_for(forged: Option<&str>, path: &str) -> String {
-    format!("https://{}/drive/v3/{path}", forged.unwrap_or(API_HOST))
+    format!("https://{}/{path}", forged.unwrap_or(API_HOST))
 }
 /// Rewrites a validated Google URL for the forged identity: the connection
 /// and certificate name become `forged`, only the Host header stays real.
@@ -120,7 +121,7 @@ impl Api {
         );
         Ok(Self {
             live: Arc::new(Mutex::new(Live {
-                client: client_for(ip, forged.as_deref())?,
+                client: client_for(ip, forged.as_deref(), API_HOST)?,
                 ip,
                 forged,
                 backups: VecDeque::new(),
@@ -152,13 +153,26 @@ impl Api {
         &self,
         build: impl Fn(&Client, Option<&str>) -> reqwest::blocking::RequestBuilder,
     ) -> Result<reqwest::blocking::Response> {
+        self.deliver_to(API_HOST, build)
+    }
+    /// `deliver` for another Google host served by the same endpoints.
+    fn deliver_to(
+        &self,
+        host: &str,
+        build: impl Fn(&Client, Option<&str>) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::Response> {
         let (client, ip, forged) = {
             let live = self.live.lock().unwrap();
-            (live.client.clone(), live.ip, live.forged.clone())
+            let client = if host == API_HOST {
+                live.client.clone()
+            } else {
+                client_for(live.ip, live.forged.as_deref(), host)?
+            };
+            (client, live.ip, live.forged.clone())
         };
         let send = |client: &Client, forged: Option<&str>| {
             build(client, forged)
-                .header(reqwest::header::HOST, API_HOST)
+                .header(reqwest::header::HOST, host)
                 .send()
                 .map_err(|e| e.without_url())
         };
@@ -184,11 +198,11 @@ impl Api {
                 });
             }
             for identity in identities {
-                let client = client_for(Some(ip), identity.as_deref())?;
+                let client = client_for(Some(ip), identity.as_deref(), host)?;
                 match send(&client, identity.as_deref()) {
                     Ok(response) => {
                         let mut live = self.live.lock().unwrap();
-                        live.client = client;
+                        live.client = client_for(Some(ip), identity.as_deref(), API_HOST)?;
                         live.ip = Some(ip);
                         live.forged = identity.clone();
                         if let Some(db) = &db {
@@ -244,17 +258,41 @@ impl Api {
         let db = Store::open(&self.db)?;
         // The account is verified at login; refreshing its credentials cannot change it.
         let credentials = crate::auth::credentials(&db, self.account.as_deref())?;
-        let token = crate::auth::refresh(&credentials)?;
+        let token = self.refresh_pinned(&credentials)?;
         if let Some(account) = &self.account {
             db.save_token(account, &token.access_token, token.expires_in)?;
         }
         Ok(token.access_token)
     }
+    /// Refreshes over the pinned endpoint so transfers need no proxy for
+    /// OAuth either; without one, or when it does not answer as Google's
+    /// token endpoint, falls back to the system-proxy route.
+    fn refresh_pinned(&self, credentials: &crate::auth::Credentials) -> Result<crate::auth::Token> {
+        if self.route().0.is_some() {
+            let form = credentials.refresh_form();
+            let reply = self
+                .deliver_to(TOKEN_HOST, |client, forged| {
+                    client
+                        .post(format!("https://{}/token", forged.unwrap_or(TOKEN_HOST)))
+                        .form(&form)
+                })
+                .ok()
+                .and_then(|response| {
+                    let status = response.status();
+                    let data = response.json().ok()?;
+                    crate::auth::from_google(&data).then_some((status, data))
+                });
+            if let Some((status, data)) = reply {
+                return crate::auth::refreshed(status, &data);
+            }
+        }
+        crate::auth::refresh(credentials)
+    }
     fn account_for_token(&self, token: &str) -> Result<String> {
         let response = self
             .deliver(|client, forged| {
                 client
-                    .get(url_for(forged, "about"))
+                    .get(url_for(forged, "drive/v3/about"))
                     .query(&[("fields", "user(emailAddress)")])
                     .bearer_auth(token)
             })
@@ -302,7 +340,7 @@ impl Api {
     ) -> Result<serde_json::Value> {
         let build = |client: &Client, forged: Option<&str>, token: &str| {
             let mut request = client
-                .request(method.clone(), url_for(forged, path))
+                .request(method.clone(), url_for(forged, &format!("drive/v3/{path}")))
                 .query(query)
                 .bearer_auth(token);
             if let Some(body) = body {
@@ -529,7 +567,7 @@ mod tests {
     #[test]
     fn login_client_uses_proxy() {
         crate::test_network::assert_route("api::tests::login_client_uses_proxy", true, |url| {
-            Ok(client_for(None, None)?
+            Ok(client_for(None, None, API_HOST)?
                 .get(url)
                 .send()?
                 .error_for_status()?
@@ -542,12 +580,27 @@ mod tests {
             "api::tests::pinned_client_bypasses_proxy",
             false,
             |url| {
-                Ok(client_for(Some("127.0.0.1".parse()?), None)?
+                Ok(client_for(Some("127.0.0.1".parse()?), None, API_HOST)?
                     .get(url)
                     .send()?
                     .error_for_status()?
                     .json()?)
             },
+        );
+    }
+    #[test]
+    fn urls_keep_drive_and_upload_paths() {
+        assert_eq!(
+            url_for(None, "drive/v3/about"),
+            "https://www.googleapis.com/drive/v3/about"
+        );
+        assert_eq!(
+            url_for(None, "upload/drive/v3/files"),
+            "https://www.googleapis.com/upload/drive/v3/files"
+        );
+        assert_eq!(
+            url_for(Some(FORGED_HOST), "upload/drive/v3/files"),
+            "https://g.cn/upload/drive/v3/files"
         );
     }
     #[test]

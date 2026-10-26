@@ -50,6 +50,14 @@ impl Credentials {
         );
         Ok(credentials)
     }
+    pub fn refresh_form(&self) -> [(&'static str, &str); 4] {
+        [
+            ("client_id", &self.client_id),
+            ("client_secret", &self.client_secret),
+            ("refresh_token", &self.refresh_token),
+            ("grant_type", "refresh_token"),
+        ]
+    }
     pub fn client(&self) -> Client {
         Client {
             client_id: self.client_id.clone(),
@@ -96,7 +104,11 @@ fn google_error(status: StatusCode, data: &Value) -> String {
         None => format!("{status} {code}"),
     }
 }
-fn refreshed(status: StatusCode, data: &Value) -> Result<Token> {
+/// Whether a token-endpoint reply is Google's answer rather than some other page.
+pub(crate) fn from_google(data: &Value) -> bool {
+    data["access_token"].is_string() || data["error"].is_string()
+}
+pub(crate) fn refreshed(status: StatusCode, data: &Value) -> Result<Token> {
     if !status.is_success() {
         if data["error"] == "invalid_grant" {
             bail!("refresh credential expired or revoked; run gdirect login --reauth");
@@ -116,15 +128,7 @@ fn refreshed(status: StatusCode, data: &Value) -> Result<Token> {
     })
 }
 pub fn refresh(credentials: &Credentials) -> Result<Token> {
-    let (status, data) = post_token(
-        TOKEN_URI,
-        &[
-            ("client_id", &credentials.client_id),
-            ("client_secret", &credentials.client_secret),
-            ("refresh_token", &credentials.refresh_token),
-            ("grant_type", "refresh_token"),
-        ],
-    )?;
+    let (status, data) = post_token(TOKEN_URI, &credentials.refresh_form())?;
     refreshed(status, &data)
 }
 pub fn prepare_login(
@@ -374,6 +378,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn only_google_token_replies_count() {
+        assert!(from_google(&serde_json::json!({"access_token":"ya29.a"})));
+        assert!(from_google(&serde_json::json!({"error":"invalid_client"})));
+        assert!(!from_google(&serde_json::json!({"error":{"code":404}})));
+        assert!(!from_google(&Value::Null));
     }
     #[test]
     fn pkce_rfc7636_vector() {

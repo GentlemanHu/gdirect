@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Token refresh during `browse`, `ls`, `download` and `upload` goes to `oauth2.googleapis.com` through the same scanned Google IP as the transfer, so it no longer needs a proxy. If that IP does not answer as Google's token endpoint, gdirect falls back to the system network as before. Sign-in and `mount` are unchanged. (Thanks to @tactfullotto, #4.)
+
+### Fixed
+
+- Uploads failed with 404 since 0.5.0: the upload URL repeated `/drive/v3/`. (Thanks to @tkxxx33, #6.)
+
 ## 0.8.0
 
 ### Changed
