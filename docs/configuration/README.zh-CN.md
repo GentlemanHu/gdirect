@@ -54,11 +54,11 @@ gdirect browse
 | `Drive API 403 … insufficient permission` | 在客户端所在的**同一个项目**中启用 Drive API（[第 1 步](google-cloud.zh-CN.md#1-新建项目并启用-drive-api)），并保存 Drive 权限范围（[第 3 步](google-cloud.zh-CN.md#3-添加-drive-权限范围)）；然后执行 `gdirect login --reauth` 并允许访问云端硬盘 |
 | `refresh credential expired or revoked` | 执行 `gdirect login --reauth`。如果每 7 天出现一次，说明应用仍处于测试状态（见[第 5 步](google-cloud.zh-CN.md#5-允许你的账号登录)） |
 | 登录超时或报网络错误 | 系统网络需要能访问 `oauth2.googleapis.com` 和 `accounts.google.com`，见[工作原理](../../README.zh-CN.md#工作原理) |
-| 登错账号或需要切换账号 | 执行 `gdirect login --reauth`，选择另一个账号 |
+| 登错账号或需要另一个账号 | 执行 `gdirect login --add` 并选择另一个账号；它会和原账号并存，并成为默认账号。`gdirect switch` 切换默认账号，`gdirect logout 账号` 退出单个账号 |
 
-- **挂载与新凭据：** 正在运行的挂载会继续使用旧凭据。执行 `--reauth` 后，请先卸载再重新挂载。
+- **挂载与新凭据：** 正在运行的挂载会继续使用旧凭据。执行 `--reauth` 后，请先卸载该账号再重新挂载。
 - **无界面服务器：** 浏览器登录要求在同一台机器上打开浏览器。可以先在桌面电脑上登录，或者用 `gdirect login --credentials 路径` 导入已有的 `authorized_user` 凭据 JSON。Google Cloud SDK 生成的应用默认凭据（ADC）通常不包含 Drive 权限。
-- **退出登录：** `gdirect logout` 会删除已保存的凭据。也可以在 [myaccount.google.com/permissions](https://myaccount.google.com/permissions) 撤销授权。
+- **退出登录：** `gdirect logout` 会删除默认账号已保存的凭据（其他账号用 `gdirect logout 账号`，全部账号用 `--all`）。也可以在 [myaccount.google.com/permissions](https://myaccount.google.com/permissions) 撤销授权。
 - **妥善保管：** 客户端 JSON、凭据 JSON 和 SQLite 数据库都要像密码一样对待，不要提交到 Git，也不要分享给别人。
 
 Google 官方文档：[桌面应用 OAuth](https://developers.google.com/identity/protocols/oauth2/native-app)、[刷新令牌的过期规则](https://developers.google.com/identity/protocols/oauth2#expiration)。

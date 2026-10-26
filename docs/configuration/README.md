@@ -54,11 +54,11 @@ gdirect browse
 | `Drive API 403 … insufficient permission` | Enable the Drive API in the **same** project as the client ([step 1](google-cloud.md#1-create-a-project-and-enable-the-drive-api)) and save the Drive scope ([step 3](google-cloud.md#3-add-the-drive-scope)). Then run `gdirect login --reauth` and allow Drive access |
 | `refresh credential expired or revoked` | Run `gdirect login --reauth`. If this happens every 7 days, the app is still in Testing ([step 5](google-cloud.md#5-allow-your-account-to-sign-in)) |
 | Sign-in times out or shows a network error | Your system network must reach `oauth2.googleapis.com` and `accounts.google.com`; see [How it works](../../README.md#how-it-works) |
-| Wrong account, or switching accounts | `gdirect login --reauth`, then choose the other account |
+| Wrong account, or another account | `gdirect login --add` and choose the other account; it is added next to the first and becomes the default. `gdirect switch` changes the default, `gdirect logout ACCOUNT` removes one |
 
-- **Mounts and new credentials:** a running mount keeps its old credentials. After `--reauth`, unmount and mount again.
+- **Mounts and new credentials:** a running mount keeps its old credentials. After `--reauth`, unmount and mount that account again.
 - **Headless servers:** browser sign-in needs a browser on the same machine. Sign in on a desktop, or import an existing `authorized_user` credentials JSON with `gdirect login --credentials PATH`. Google Cloud SDK application-default credentials usually lack the Drive scope.
-- **Logging out:** `gdirect logout` deletes the stored credentials. You can also revoke access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+- **Logging out:** `gdirect logout` deletes the default account's stored credentials (`gdirect logout ACCOUNT` for another, `--all` for every account). You can also revoke access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
 - **Keep files private:** treat the client JSON, credentials JSON and the SQLite database like passwords. Do not commit or share them.
 
 Google's reference: [OAuth for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app), [refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).

@@ -130,6 +130,21 @@ gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
 
 写脚本时可以用 `GDIRECT_ACCESS_TOKEN` 直接提供访问令牌，不必登录（`mount` 仍然需要先 `gdirect login`）。
 
+
+## 多账号
+
+用同一个 OAuth 客户端登录更多 Google 账号：
+
+```sh
+gdirect login --add                # 在浏览器里选择另一个账号
+gdirect accounts                   # * 表示默认账号
+gdirect switch work                # 把 work@… 设为默认账号
+gdirect -a me@gmail.com browse     # 只在这一条命令里使用某个账号
+gdirect logout work                # 退出一个账号（--all 退出全部）
+```
+
+所有命令都接受 `-a`/`--account`，值可以是完整邮箱，也可以是不会混淆的前缀；在 shell 或脚本里可以用 `GDIRECT_ACCOUNT` 设置。最近一次登录的账号会成为默认账号，`browse` 的标题栏会显示当前账号。每个账号有各自的文件夹缓存和上传会话，也可以同时挂载（各用一个目录）。OAuth 应用处于测试状态时，每个账号都要加为测试用户（见[第 5 步](docs/configuration/google-cloud.zh-CN.md#5-允许你的账号登录)）。
+
 ## 挂载
 
 挂载需要先通过 `--with-mount` 或上面的 Homebrew 步骤装好依赖。
@@ -145,6 +160,7 @@ gdirect unmount
 - macOS/Linux 的挂载目录必须为空；Windows 的挂载目录必须是还不存在的路径。
 - 写入的文件先进本地缓存，再在后台上传。缓存会尽量控制在 5 GiB 以内，但正在使用或尚未上传的文件可能让它超出。`mount` 会打印日志路径，日志里出现 `to upload 0, uploading 0` 就说明上传已经完成。
 - `unmount` 会保留还没上传的文件，下次 `mount` 时继续上传。
+- `mount -a 账号` 挂载其他账号。`unmount` 会卸载默认账号的挂载或唯一的挂载；有多个挂载时加上 `-a 账号`。
 - `-j` 控制 rclone 同时进行的传输数。
 
 ## 本地数据与退出登录
@@ -155,7 +171,7 @@ gdirect unmount
 - Linux：`~/.local/share/gdirect/state.sqlite3`
 - Windows：`%LOCALAPPDATA%\gdirect\state.sqlite3`
 
-可以用 `--db PATH` 指定其他文件。`gdirect logout` 会删除已保存的凭据，保留扫描结果；退出登录前请先卸载。切换 Google 账号用 `gdirect login --reauth`。
+可以用 `--db PATH` 指定其他文件。`gdirect logout` 会删除默认账号（或你指定的账号；`--all` 表示全部账号）已保存的凭据，保留扫描结果；退出某个账号前请先卸载它的挂载。添加或切换 Google 账号见[多账号](#多账号)。
 
 登录失败、7 天过期等问题请看[常见问题](docs/configuration/README.zh-CN.md#常见问题)。
 

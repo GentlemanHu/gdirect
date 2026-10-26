@@ -120,6 +120,20 @@ Run `gdirect scan` to scan again and `gdirect scan --list` to see the results, i
 
 For scripts, `GDIRECT_ACCESS_TOKEN` can supply an access token instead of a login (`mount` still needs `gdirect login`).
 
+## Multiple accounts
+
+Sign in to more Google accounts with the same OAuth client:
+
+```sh
+gdirect login --add                # choose another account in the browser
+gdirect accounts                   # * marks the default account
+gdirect switch work                # make work@… the default
+gdirect -a me@gmail.com browse     # use one account for a single command
+gdirect logout work                # sign out one account (--all for every one)
+```
+
+Every command takes `-a`/`--account` with a full address or an unambiguous prefix; `GDIRECT_ACCOUNT` sets it for a shell or script. The account you last signed in with becomes the default, and `browse` shows the current account in its header. Each account has its own folder cache and upload sessions, and can be mounted at the same time as the others (pick a different directory). While your OAuth app is in Testing, every account must be added as a test user ([step 5](docs/configuration/google-cloud.md#5-allow-your-account-to-sign-in)).
+
 ## Mount
 
 Mounting requires the dependencies from `--with-mount` or the Homebrew step above.
@@ -136,6 +150,7 @@ gdirect unmount
 - Writes go to a local cache first and upload in the background. The cache tries to stay under 5 GiB, but open or unsent files can exceed that. Uploads are finished when the log printed by `mount` shows `to upload 0, uploading 0`.
 - `unmount` keeps files that have not been uploaded yet, and the next `mount` uploads them.
 - `-j` sets how many rclone transfers run at once.
+- `mount -a ACCOUNT` mounts another account. `unmount` detaches the default account's mount, or the only one; with several mounts add `-a ACCOUNT`.
 
 ## Your data and logout
 
@@ -145,7 +160,7 @@ Credentials, scanned IPs and settings are stored in one private SQLite file:
 - Linux: `~/.local/share/gdirect/state.sqlite3`
 - Windows: `%LOCALAPPDATA%\gdirect\state.sqlite3`
 
-Use `--db PATH` to choose another file. `gdirect logout` removes the stored credentials and keeps the scanned IPs. Unmount before logging out. To switch Google accounts, run `gdirect login --reauth`.
+Use `--db PATH` to choose another file. `gdirect logout` removes the default account's stored credentials (or the account you name; `--all` removes every account) and keeps the scanned IPs. Unmount that account before logging it out. To add or switch Google accounts, see [Multiple accounts](#multiple-accounts).
 
 Sign-in problems, the 7-day expiry and other questions are covered in [Troubleshooting](docs/configuration/README.md#troubleshooting).
 

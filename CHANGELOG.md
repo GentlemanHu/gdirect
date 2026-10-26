@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Multiple Google accounts in one database. `gdirect login --add` (alias of `--reauth`) signs in another account with the saved OAuth client; `gdirect accounts` lists them, `gdirect switch ACCOUNT` changes the default, and the global `-a`/`--account` option (or `GDIRECT_ACCOUNT`) picks one for a single command by address or unambiguous prefix. `browse` shows the current account in its header.
+- Each account has its own folder cache, upload sessions and background mount, so several accounts can be mounted at once.
+
+### Changed
+
+- `gdirect logout` signs out only the default account (or `logout ACCOUNT`); `--all` signs out every account. The saved OAuth client is removed once no account is left.
+- Existing databases are migrated automatically: the current login becomes the default account. Unfinished uploads from older versions start over.
+
 ## 0.5.0
 
 ### Added
