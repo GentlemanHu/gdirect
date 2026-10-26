@@ -129,6 +129,10 @@ fn probe(ip: IpAddr, forged: bool) -> Result<(i64, Option<String>)> {
     Ok((start.elapsed().as_millis() as i64, warning))
 }
 pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
+    if path.is_none() {
+        crate::ranges::refresh(db, db.best_route()?.map(|r| r.ip));
+    }
+    let google = crate::ranges::current(db);
     let ips = candidates(db, path)?;
     eprintln!(
         "Scanning {} candidates (TLS + Drive API + test download)…",
@@ -180,10 +184,11 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
                     warned = true;
                 }
                 db.endpoint(&ip.to_string(), Some(ms), None, sni)?;
+                let owner = if google.contains(ip) { "" } else { "  [third-party relay]" };
                 if sni.is_empty() {
-                    eprintln!("  OK  {ip}  {ms} ms");
+                    eprintln!("  OK  {ip}  {ms} ms{owner}");
                 } else {
-                    eprintln!("  OK  {ip}  {ms} ms (SNI {sni})");
+                    eprintln!("  OK  {ip}  {ms} ms (SNI {sni}){owner}");
                 }
             }
             Err(error) => {

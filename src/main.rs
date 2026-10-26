@@ -3,6 +3,7 @@ mod auth;
 mod download;
 mod drive;
 mod mount;
+mod ranges;
 mod scan;
 mod store;
 mod tui;
@@ -197,11 +198,21 @@ fn run(cli: Cli) -> Result<()> {
     });
     match command {
         Commands::Scan { list: true, .. } => {
+            let google = ranges::current(&db);
             for e in db.endpoints()? {
+                // Anything outside Google's published space is someone else's relay.
+                let owner = match e.ip.parse() {
+                    Ok(ip) if google.contains(ip) => "",
+                    _ => " [third-party relay]",
+                };
                 match e.latency_ms {
-                    Some(ms) if e.sni.is_empty() => println!("{}\tOK\t{ms} ms", e.ip),
-                    Some(ms) => println!("{}\tOK\t{ms} ms (SNI {})", e.ip, e.sni),
-                    None => println!("{}\tunavailable\t{}", e.ip, e.error.unwrap_or_default()),
+                    Some(ms) if e.sni.is_empty() => println!("{}\tOK\t{ms} ms{owner}", e.ip),
+                    Some(ms) => println!("{}\tOK\t{ms} ms (SNI {}){owner}", e.ip, e.sni),
+                    None => println!(
+                        "{}\tunavailable\t{}{owner}",
+                        e.ip,
+                        e.error.unwrap_or_default()
+                    ),
                 }
             }
         }
