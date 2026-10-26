@@ -2,26 +2,26 @@
 class Gdirect < Formula
   desc "Browse, download, upload and mount Google Drive"
   homepage "https://github.com/mizorewww/gdirect"
-  version "0.7.0"
+  version "0.8.0"
   license "GPL-2.0-or-later"
 
   on_macos do
     depends_on macos: :sequoia
     on_arm do
-      url "https://github.com/mizorewww/gdirect/releases/download/v0.7.0/gdirect-0.7.0-aarch64-apple-darwin.tar.gz"
-      sha256 "113e22b378d4e067f5b8517167415b65baf7025fa92d961ae4546c5fafd51910"
+      url "https://github.com/mizorewww/gdirect/releases/download/v0.8.0/gdirect-0.8.0-aarch64-apple-darwin.tar.gz"
+      sha256 "8d54fc6f48e71ca89ed0f8331e2f086dbbdc10e5ea7da5e450440462eca408dd"
     end
     on_intel do
-      url "https://github.com/mizorewww/gdirect/releases/download/v0.7.0/gdirect-0.7.0-x86_64-apple-darwin.tar.gz"
-      sha256 "3f2333dcfcbb4f158ca226f92148fe42b84237cfa529ccfce64572f17fe87178"
+      url "https://github.com/mizorewww/gdirect/releases/download/v0.8.0/gdirect-0.8.0-x86_64-apple-darwin.tar.gz"
+      sha256 "692e8eed32fcc37f26aa960dc2846e026cebbb9bfbf4b3bde89374261c3fbe5b"
     end
   end
 
   on_linux do
     depends_on arch: :x86_64
     on_intel do
-      url "https://github.com/mizorewww/gdirect/releases/download/v0.7.0/gdirect-0.7.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "b7fbcd0e88f552da4ec9539603e4e649aaa9a245183d569d187556a0ba1180c8"
+      url "https://github.com/mizorewww/gdirect/releases/download/v0.8.0/gdirect-0.8.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "f8850b902197863dc811c3bf77598d3bb3216b12ed14da3f9c3e86bb3bae934f"
     end
   end
 
