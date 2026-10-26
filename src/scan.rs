@@ -1,18 +1,34 @@
-use crate::store::Store;
+use crate::{ranges::Ranges, store::Store};
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeSet,
+    collections::{HashSet, VecDeque},
     io::Read,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs},
     path::Path,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-// A bootstrap candidate from Cealing-Host; always probed, never assumed reachable.
-const SEED: &str = "183.56.143.147";
 const LIMIT: usize = 256;
+/// Verified endpoints to collect before a sweep stops.
+const TARGET: usize = 8;
+/// Upper bound on TCP probes in one sweep.
+const MAX_PROBES: usize = 60_000;
+/// Addresses swept per batch: TCP first, then full verification of what answered.
+const BATCH: usize = 2048;
+const TCP_WORKERS: usize = 256;
+const TCP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Host numbers inside a /24 where Google's general front ends answer. .187,
+/// .207 and .219 are Cloud Storage-only front ends and never serve Drive.
+const OFFSETS: [u8; 7] = [100, 113, 155, 132, 138, 91, 123];
+/// Blocks that hold most of Google's general front ends; swept before the
+/// rest of Google's space.
+const CORE: &str = "142.250.0.0/15 172.217.0.0/16 172.253.0.0/16 173.194.0.0/16 74.125.0.0/16 192.178.0.0/15 64.233.160.0/19 66.102.0.0/20 108.177.0.0/17 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19 108.170.192.0/18 72.14.192.0/18";
+const SEEDS: &str = include_str!("frontend-seeds.txt");
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -34,44 +50,141 @@ fn public(ip: IpAddr) -> bool {
         }
     }
 }
-fn candidates(db: &Store, path: Option<&Path>) -> Result<Vec<IpAddr>> {
-    let mut ips = BTreeSet::new();
-    if let Some(path) = path {
-        for line in std::fs::read_to_string(path)?.lines() {
-            let value = line.split('#').next().unwrap_or("").trim();
-            if !value.is_empty() {
-                let ip = value
-                    .parse::<IpAddr>()
-                    .context("candidate file must contain one IP per line")?;
-                ensure!(public(ip), "candidate must be a public IP");
-                ips.insert(ip);
-            }
-        }
-    } else {
-        ips.insert(SEED.parse()?);
-        // DNS supplies candidates only. TLS and both Drive endpoints still have to pass.
-        for host in [
-            "www.googleapis.com",
-            "drive.usercontent.google.com",
-            "drive.google.com",
-        ] {
-            if let Ok(addresses) = (host, 443).to_socket_addrs() {
-                ips.extend(addresses.map(|a| a.ip()).filter(|ip| public(*ip)));
-            }
-        }
-        for ip in db.rescan_candidates(LIMIT)? {
-            if ips.len() >= LIMIT {
-                break;
-            }
-            if let Ok(ip) = ip.parse()
-                && public(ip)
-            {
-                ips.insert(ip);
+fn file_candidates(path: &Path) -> Result<Vec<IpAddr>> {
+    let mut ips = Vec::new();
+    for line in std::fs::read_to_string(path)?.lines() {
+        let value = line.split('#').next().unwrap_or("").trim();
+        if !value.is_empty() {
+            let ip = value
+                .parse::<IpAddr>()
+                .context("candidate file must contain one IP per line")?;
+            ensure!(public(ip), "candidate must be a public IP");
+            if !ips.contains(&ip) {
+                ips.push(ip);
             }
         }
     }
     ensure!(!ips.is_empty(), "no candidate IPs");
-    Ok(ips.into_iter().collect())
+    Ok(ips)
+}
+/// Small xorshift generator; the sweep order only needs to differ between
+/// users so they do not all hammer the same front ends.
+struct Shuffle(u64);
+impl Shuffle {
+    fn new() -> Self {
+        let mut seed = [0; 8];
+        let _ = getrandom::fill(&mut seed);
+        Self(u64::from_le_bytes(seed) | 1)
+    }
+    fn next(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+    fn apply<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            items.swap(i, self.next(i + 1));
+        }
+    }
+}
+fn hosts(net: u32) -> impl Iterator<Item = IpAddr> {
+    OFFSETS
+        .iter()
+        .map(move |&o| IpAddr::V4(Ipv4Addr::from(net | u32::from(o))))
+}
+/// Sweep order: earlier verified endpoints, DNS answers, seed /24s, then
+/// Google's core front-end blocks and finally the rest of its space, each
+/// shuffled. Only addresses inside `google` are ever considered.
+fn plan(
+    google: &Ranges,
+    known: &[IpAddr],
+    dns: &[IpAddr],
+    shuffle: &mut Shuffle,
+) -> VecDeque<IpAddr> {
+    let core = Ranges::parse(&CORE.replace(' ', "\n")).expect("core blocks must parse");
+    let seeds = Ranges::parse(SEEDS).expect("seed list must parse");
+    let mut seen = HashSet::new();
+    let mut order = VecDeque::new();
+    let mut add = |ip: IpAddr, order: &mut VecDeque<IpAddr>| {
+        if public(ip) && google.contains(ip) && seen.insert(ip) {
+            order.push_back(ip);
+        }
+    };
+    for &ip in known.iter().chain(dns) {
+        add(ip, &mut order);
+    }
+    let mut seed_nets: Vec<u32> = seeds.slash24s().collect();
+    shuffle.apply(&mut seed_nets);
+    let (mut core_nets, mut rest_nets): (Vec<u32>, Vec<u32>) = google
+        .slash24s()
+        .filter(|n| !seeds.contains(IpAddr::V4(Ipv4Addr::from(*n))))
+        .partition(|n| core.contains(IpAddr::V4(Ipv4Addr::from(*n))));
+    shuffle.apply(&mut core_nets);
+    shuffle.apply(&mut rest_nets);
+    for net in seed_nets.into_iter().chain(core_nets).chain(rest_nets) {
+        for ip in hosts(net) {
+            add(ip, &mut order);
+        }
+    }
+    order
+}
+/// TCP connect to port 443 on every address; returns the ones that answered
+/// with their connect time, fastest first.
+fn tcp_sweep(ips: &[IpAddr]) -> Vec<(IpAddr, Duration)> {
+    let next = AtomicUsize::new(0);
+    let open = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        for _ in 0..TCP_WORKERS.min(ips.len()) {
+            scope.spawn(|| {
+                while let Some(&ip) = ips.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let start = Instant::now();
+                    if TcpStream::connect_timeout(&SocketAddr::new(ip, 443), TCP_TIMEOUT).is_ok() {
+                        open.lock().unwrap().push((ip, start.elapsed()));
+                    }
+                }
+            });
+        }
+    });
+    let mut open = open.into_inner().unwrap();
+    open.sort_by_key(|&(_, t)| t);
+    open
+}
+type Verdict = (
+    IpAddr,
+    std::result::Result<(i64, Option<String>), String>,
+    &'static str,
+);
+/// Full probe of each address with 8 workers: the real SNI first, the forged
+/// identity only when the real one cannot complete. Stops handing out work
+/// once `enough` endpoints have verified.
+fn verify(ips: &[IpAddr], enough: usize) -> Vec<Verdict> {
+    let next = AtomicUsize::new(0);
+    let good = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        for _ in 0..8.min(ips.len()) {
+            scope.spawn(|| {
+                while good.load(Ordering::Relaxed) < enough {
+                    let Some(&ip) = ips.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let (result, sni) = match probe(ip, false) {
+                        Ok(ok) => (Ok(ok), ""),
+                        Err(real) => match probe(ip, true) {
+                            Ok(ok) => (Ok(ok), crate::api::FORGED_HOST),
+                            Err(forged) => (Err(format!("{real:#} | forged: {forged:#}")), ""),
+                        },
+                    };
+                    if result.is_ok() {
+                        good.fetch_add(1, Ordering::Relaxed);
+                    }
+                    results.lock().unwrap().push((ip, result, sni));
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap()
 }
 // A missing or changed public test file is reported as a warning, not as a dead IP.
 //
@@ -128,77 +241,126 @@ fn probe(ip: IpAddr, forged: bool) -> Result<(i64, Option<String>)> {
     };
     Ok((start.elapsed().as_millis() as i64, warning))
 }
-pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
-    if path.is_none() {
-        crate::ranges::refresh(db, db.best_route()?.map(|r| r.ip));
-    }
-    let google = crate::ranges::current(db);
-    let ips = candidates(db, path)?;
-    eprintln!(
-        "Scanning {} candidates (TLS + Drive API + test download)…",
-        ips.len()
-    );
-    let (tx, rx) = mpsc::channel();
-    let candidates = Arc::new(Mutex::new(ips.into_iter()));
-    let mut warned = false;
-    thread::scope(|scope| {
-        for _ in 0..8 {
-            let tx = tx.clone();
-            let candidates = candidates.clone();
-            scope.spawn(move || {
-                loop {
-                    let next = candidates.lock().unwrap().next();
-                    let Some(ip) = next else {
-                        break;
-                    };
-                    // The real SNI is tried first; a forged identity gets a
-                    // chance only when the real one cannot complete a probe.
-                    let (result, sni) = match probe(ip, false) {
-                        Ok(ok) => (Ok(ok), ""),
-                        Err(real) => match probe(ip, true) {
-                            Ok(ok) => (Ok(ok), crate::api::FORGED_HOST),
-                            Err(forged) => (Err(format!("{real:#} | forged: {forged:#}")), ""),
-                        },
-                    };
-                    let _ = tx.send((ip, result, sni));
-                }
-            });
-        }
-        drop(tx);
-        let mut results = Vec::new();
-        for (ip, result, sni) in rx {
-            results.push((ip, result, sni));
-        }
-        results
-    })
-    .into_iter()
-    .try_for_each(|(ip, result, sni)| -> Result<()> {
+/// Records verdicts and prints the working endpoints; returns how many verified.
+fn record(
+    db: &Store,
+    google: &Ranges,
+    verdicts: Vec<Verdict>,
+    store_failures: impl Fn(IpAddr) -> bool,
+    warned: &mut bool,
+) -> Result<Vec<IpAddr>> {
+    let mut good = Vec::new();
+    for (ip, result, sni) in verdicts {
         match result {
             Ok((ms, problem)) => {
                 if let Some(problem) = problem
-                    && !warned
+                    && !*warned
                 {
                     eprintln!(
                         "warning: Drive test file probe failed ({problem}); IPs were verified with the Drive API probe only"
                     );
-                    warned = true;
+                    *warned = true;
                 }
                 db.endpoint(&ip.to_string(), Some(ms), None, sni)?;
-                let owner = if google.contains(ip) { "" } else { "  [third-party relay]" };
+                let owner = if google.contains(ip) {
+                    ""
+                } else {
+                    "  [third-party relay]"
+                };
                 if sni.is_empty() {
                     eprintln!("  OK  {ip}  {ms} ms{owner}");
                 } else {
                     eprintln!("  OK  {ip}  {ms} ms (SNI {sni}){owner}");
                 }
+                good.push(ip);
             }
-            Err(error) => {
+            Err(error) if store_failures(ip) => {
                 db.endpoint(&ip.to_string(), None, Some(&error), "")?;
                 eprintln!("  --  {ip}  unavailable");
             }
+            Err(_) => {}
         }
-        Ok(())
-    })?;
-    let route=db.best_route()?.context("no usable IP found; verify system direct routing or provide candidates with gdirect scan --ips FILE")?;
+    }
+    Ok(good)
+}
+pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
+    let google = crate::ranges::current(db);
+    let mut warned = false;
+    if let Some(path) = path {
+        // Explicit candidates are probed exactly as listed, relays included.
+        let ips = file_candidates(path)?;
+        eprintln!(
+            "Scanning {} candidates (TLS + Drive API + test download)…",
+            ips.len()
+        );
+        let verdicts = verify(&ips, usize::MAX);
+        record(db, &google, verdicts, |_| true, &mut warned)?;
+    } else {
+        crate::ranges::refresh(db, db.best_route()?.map(|r| r.ip));
+        let google = crate::ranges::current(db);
+        let known: Vec<IpAddr> = db
+            .rescan_candidates(LIMIT)?
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+        // DNS supplies candidates only; poisoned answers fall outside Google's space.
+        let dns: Vec<IpAddr> = ["www.googleapis.com", "drive.usercontent.google.com"]
+            .iter()
+            .filter_map(|host| (*host, 443).to_socket_addrs().ok())
+            .flatten()
+            .map(|a| a.ip())
+            .collect();
+        let mut queue = plan(&google, &known, &dns, &mut Shuffle::new());
+        let mut tried: HashSet<IpAddr> = HashSet::new();
+        let mut reached: HashSet<IpAddr> = HashSet::new();
+        eprintln!(
+            "Sweeping Google front ends for {TARGET} that serve Drive from this network (TCP, then TLS + Drive API + test download)…"
+        );
+        let (mut probed, mut open, mut good) = (0, 0, 0);
+        let mut intercepted = false;
+        while good < TARGET && probed < MAX_PROBES && !queue.is_empty() {
+            let batch: Vec<IpAddr> = std::iter::from_fn(|| queue.pop_front())
+                .filter(|ip| tried.insert(*ip))
+                .take(BATCH)
+                .collect();
+            probed += batch.len();
+            let answered = tcp_sweep(&batch);
+            open += answered.len();
+            // Real networks block most of Google; a TUN proxy accepts every connect.
+            if batch.len() >= 256 && answered.len() * 10 >= batch.len() * 9 && !intercepted {
+                intercepted = true;
+                eprintln!(
+                    "warning: almost every address answered TCP, so a TUN proxy or VPN is probably intercepting; results reflect the proxy, not your direct network. Route Google IPs DIRECT for a real scan"
+                );
+            }
+            let candidates: Vec<IpAddr> = answered.into_iter().map(|(ip, _)| ip).collect();
+            reached.extend(&candidates);
+            let verdicts = verify(&candidates, TARGET - good);
+            let working = record(db, &google, verdicts, |ip| known.contains(&ip), &mut warned)?;
+            good += working.len();
+            // Front ends come in groups: the rest of a working /24 goes next.
+            for ip in working.iter().rev() {
+                if let IpAddr::V4(v4) = ip {
+                    for neighbour in hosts(u32::from(*v4) & !0xff) {
+                        if !tried.contains(&neighbour) {
+                            queue.push_front(neighbour);
+                        }
+                    }
+                }
+            }
+            eprintln!("  … probed {probed}, {open} answered TCP, {good} verified");
+        }
+        // Earlier endpoints that no longer even answer TCP are marked dead.
+        for ip in known
+            .iter()
+            .filter(|ip| tried.contains(ip) && !reached.contains(ip))
+        {
+            db.endpoint(&ip.to_string(), None, Some("no TCP answer"), "")?;
+        }
+    }
+    let route = db.best_route()?.context(
+        "no usable Google front end found; route Google IPs DIRECT if you use a TUN proxy, or provide candidates with gdirect scan --ips FILE",
+    )?;
     eprintln!("Selected a verified endpoint; saved in SQLite.");
     Ok(route)
 }
@@ -217,6 +379,48 @@ mod tests {
         ] {
             assert!(!public(s.parse().unwrap()));
         }
-        assert!(public(SEED.parse().unwrap()));
+        assert!(public("142.250.27.100".parse().unwrap()));
+    }
+    #[test]
+    fn sweep_order_keeps_to_google_space() {
+        let google = crate::ranges::embedded();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let known = [ip("142.250.27.100"), ip("183.56.143.147")];
+        let dns = [
+            ip("69.63.184.30"),
+            ip("172.217.115.4"),
+            ip("142.250.27.100"),
+        ];
+        let order = plan(&google, &known, &dns, &mut Shuffle(42));
+        // Stored and DNS answers first, relays and poisoned answers dropped, no repeats.
+        assert_eq!(order[0], ip("142.250.27.100"));
+        assert_eq!(order[1], ip("172.217.115.4"));
+        assert!(order.iter().all(|a| google.contains(*a)));
+        assert_eq!(order.iter().collect::<HashSet<_>>().len(), order.len());
+        // Seed /24s come before the rest; Cloud Storage-only hosts are never swept.
+        let seeds = Ranges::parse(SEEDS).unwrap();
+        assert!(seeds.contains(order[2]));
+        let first_other = order
+            .iter()
+            .skip(2)
+            .position(|a| !seeds.contains(*a))
+            .unwrap()
+            + 2;
+        assert!(order.iter().skip(first_other).all(|a| !seeds.contains(*a)));
+        let core = Ranges::parse(&CORE.replace(' ', "\n")).unwrap();
+        assert!(core.contains(order[first_other]));
+        assert!(order.iter().all(|a| match a {
+            IpAddr::V4(v4) =>
+                ![187, 207, 219].contains(&v4.octets()[3]) || known.contains(a) || dns.contains(a),
+            _ => true,
+        }));
+    }
+    #[test]
+    fn shuffle_is_a_permutation() {
+        let mut items: Vec<u32> = (0..100).collect();
+        Shuffle(7).apply(&mut items);
+        assert_ne!(items, (0..100).collect::<Vec<_>>());
+        items.sort();
+        assert_eq!(items, (0..100).collect::<Vec<_>>());
     }
 }

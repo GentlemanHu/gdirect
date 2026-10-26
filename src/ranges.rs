@@ -158,6 +158,12 @@ impl Ranges {
             IpAddr::V6(a) => find(&self.v6, u128::from(a)),
         }
     }
+    /// Network address of every IPv4 /24 inside the ranges.
+    pub fn slash24s(&self) -> impl Iterator<Item = u32> + '_ {
+        self.v4
+            .iter()
+            .flat_map(|&(start, end)| ((start >> 8)..=(end >> 8)).map(|n| n << 8))
+    }
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         let mut emit = |start: u128, end: u128, bits: u32, v4: bool| {
@@ -300,6 +306,15 @@ mod tests {
         assert_eq!(Ranges::parse(&r.to_text()).unwrap(), r);
         // Too small to be Google's real feed.
         assert!(Ranges::from_feeds(goog, cloud).is_err());
+    }
+    #[test]
+    fn slash24s_enumerate_networks() {
+        let r = Ranges::parse("1.2.3.0/23\n9.9.9.9/32").unwrap();
+        let nets: Vec<_> = r.slash24s().map(std::net::Ipv4Addr::from).collect();
+        assert_eq!(
+            nets,
+            ["1.2.2.0", "1.2.3.0", "9.9.9.0"].map(|s| s.parse::<std::net::Ipv4Addr>().unwrap())
+        );
     }
     #[test]
     fn embedded_round_trips() {
