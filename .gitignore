@@ -21,3 +21,8 @@ web/.impeccable/
 service-logs/
 .cargo/
 .cloudflare/
+
+# Promo and animations (private, not open-sourced)
+docs/onetake-promo/
+docs/images/
+*.mp4
