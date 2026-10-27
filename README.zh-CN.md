@@ -1,207 +1,130 @@
-# gdirect
+# gdirect · Google Drive 高性能流媒体网关与传输系统
 
-[English](README.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · [Releases 预编译下载](https://github.com/GentlemanHu/gdirect/releases) · [更新日志](CHANGELOG.md) · [项目说明文档](文件说明.md)
 
-gdirect 是一个在终端里浏览、下载、上传和挂载 Google 云盘的工具。它会找出当前网络能连通的 Google IP，让云盘流量直接连过去，下载支持多连接和断点续传。
+gdirect 是面向 Google 云盘（Google Drive）的高性能网络直连传输与私有流媒体网关系统。通过就近探测并绑定中国大陆可连通的 Google 官方边缘 IP（结合 SNI 伪装技术），绕过限速与阻断，让数 TB 的影视与大文件跑满本地物理带宽。
 
-## 工作原理
+针对云盘大容量媒体播放痛点，系统深度重构了流式传输层，内嵌现代化 React 19 单页管理控制台与影院级双字幕播放器，原生支持 WebDAV 302 重定向直连与 Emby/Jellyfin `.strm` 无盘直解。
 
-| 流量 | 走向 |
-| --- | --- |
-| Drive API、下载、上传及其刷新令牌（`browse`、`ls`、`download`、`upload`） | 扫描到的 Google IP。主机名和证书校验不变。如果带真实 SNI 的连接被重置，会自动改用伪造身份（TLS 名称用 `g.cn`，Host 头仍是真实主机），并按 IP 记住哪种方式可用 |
-| 登录与账号验证（`accounts.google.com`、`oauth2.googleapis.com`、`www.googleapis.com`），以及扫描到的 IP 无法刷新令牌时 | 系统网络（系统 DNS、代理） |
-| `mount`（rclone） | 系统网络 |
+---
 
-第一次运行传输类命令时，会检查一个已知的中转节点，并扫描 Google 自己的前端服务器，在 24 小时内沿用能用的那些。这个中转节点 183.56.143.147 不是 Google 的服务器，它把连接转发给 Google；在中国大陆它又快又稳，所以排在第一个尝试。它读不到你的流量（TLS 端到端加密，证书按 Google 根证书校验），但运营者能看到你的 IP，以及在不用伪造身份时你访问的是哪个 Google 主机。不想经过它，可以加 `--google-only`（或设置 `GDIRECT_GOOGLE_ONLY=1`），这样只用 Google 自己的前端。这些前端的地址来自 Google 公布为自有的 IP 段（[goog.json 减去 cloud.json](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges)，内置一份并每周更新）。在中国大陆，大部分 Google IP 被封，但仍有一部分前端可以直连：扫描先试 TCP 连接，只对能连上的做完整验证（TLS、Drive API 和测试下载），找到 8 个就停止。每个候选 IP 先用真实 SNI 探测，失败再试伪造身份。某个 IP（包括中转节点）失效时，请求和下载会自动换到下一个已验证的 IP。`login` 和 `mount` 不扫描。证书只按内置的 Google GTS 根校验，不信任系统 CA 包——第三方 CA 被攻破也无法对 gdirect 冒充 Google。
+## 核心特性
 
-网络要求：
+- ⚡ **HTTP 206 Partial Content 流媒体服务**：支持随意拖拽 Seek 毫秒级跳转，精准支持 MP4 `moov` / MKV `cues` 随机索引寻道与首字节秒开。
+- 💾 **零磁盘 I/O 环形内存缓冲（Zero-Disk RAM Buffer）**：8MB~512MB 纯内存弹性滑动窗口预读，告别小容量服务器的磁盘磨损与写满风险；快进时瞬间取消旧分块请求，绝无流量浪费。
+- 🎬 **影院级原生播放器**：
+  - **全格式双字幕渲染**：内置自研 ASS/SSA/SRT/VTT 文本与特效解析器（智能容错空字段并过滤控制符），支持主/副字幕双轨独立渲染与中英双语分行分色；
+  - **内嵌字幕探测**：原生嗅探容器内嵌字幕轨，并提供一键外部硬件播放器唤醒（VLC、Infuse、IINA、MX Player、PotPlayer、VidHub）；
+  - **6 档画幅比例切换**：默认最佳适配（无裁剪、黑边自适应），支持快捷键 `C` 循环切换智能铺满（去黑边）、拉伸、16:9、4:3 与 21:9；
+  - **网络静默自愈与断点自动起播**：网关重启或网络瞬断 2 秒内静默自动重连原进度；记忆秒数恢复与卡顿缓冲就绪时全自动续播。
+- 📁 **多协议与私有媒体库无盘挂载**：
+  - **WebDAV（RFC 4918）**：支持 302 重定向模式（OpenList 首选，播放器直连网关不走 OpenList 服务器重复中转）与 206 Range 直流模式；
+  - **Emby / Jellyfin `.strm` 生成器**：全盘递归扫描一键打包导出 ZIP，无需占用本地数 TB 硬盘即可实现海报刮削与原画播放。
+- 🌐 **多引擎传输调度**：
+  - `边缘直连 (Direct)`：国内直连 Google 边缘网络，客户端与网关均免翻墙；
+  - `官方 302 (Official)`：302 跳转至 Google 官方直链（客户端自备代理），网关零带宽消耗；
+  - `网关代理中继 (Proxy)`：网关通过本地代理中继数据流。
+- 📦 **全平台双版本矩阵 Release**：
+  - 每版均提供 **集成嵌入式 Web 前端全功能版** 与 **纯 CLI / Headless 超轻量版**；
+  - 原生覆盖：Linux x86_64、macOS ARM (M系列)、macOS Intel、Windows x86_64、Android ARM64-v8a、Android ARMv7-a。
 
-- 登录时，浏览器需要访问 `accounts.google.com`，程序需要访问 `oauth2.googleapis.com` 和 `www.googleapis.com`。如果 Google 被屏蔽，登录时请保持代理可用。传输期间刷新令牌同样走扫描到的 IP，不需要代理；只有该 IP 不能作为 Google 令牌端点应答时，才回退到系统网络。
-- 如果开着 TUN 模式的代理或 VPN（例如 Clash/Mihomo TUN），要把 Google 的 IP 段设为 **DIRECT 直连**，并对它们关闭 fake-ip。TUN 代理会接受所有连接，否则扫描测到的是代理而不是你的网络；`scan` 发现这种情况时会提示。`gdirect scan --list` 可以查看正在使用的 IP。
+---
 
-### 只开系统代理，不开 TUN
+## 快速上手
 
-- 在 macOS 和 Windows 上，登录与账号验证会使用系统中手动配置的 HTTP/HTTPS 代理（回退到系统网络时的刷新令牌也一样）。代理客户端保持规则模式、关闭 TUN 即可：让 `accounts.google.com`、`oauth2.googleapis.com` 和 `www.googleapis.com` 走代理。无需添加 DIRECT 规则；扫描、Drive API 请求、上传和下载仍直连扫描到的节点。
-- 如果开启 TUN 并启用了域名嗅探，`www.googleapis.com` 的代理规则也会命中这些传输，请对扫描到的 IP 关闭嗅探，或用进程规则让 gdirect 的全部流量直连，例如 Clash 的 `PROCESS-NAME,gdirect,DIRECT`。
-- 在 Linux 上或使用 PAC 时，请为每条命令设置 `HTTPS_PROXY`（客户端的 HTTP 或 mixed 端口）。`HTTP_PROXY` / `HTTPS_PROXY` 优先于系统设置，`mount` 也会把它们传给 rclone。`NO_PROXY` 不能排除上述 Google 端点。
+### 1. Docker Compose 容器化一键部署（推荐）
 
-```sh
-HTTPS_PROXY=http://127.0.0.1:7890 gdirect login --client-secret ~/Downloads/client_secret.json
-HTTPS_PROXY=http://127.0.0.1:7890 gdirect mount
+```bash
+# 下载 docker-compose.yml 并启动
+curl -fsSL https://raw.githubusercontent.com/GentlemanHu/gdirect/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d
+```
+启动后访问 `http://<服务器IP>:8080` 进入 Web 管理控制台。
+
+### 2. Android 手机 / 电视盒子 Termux 部署
+
+在支持 Termux 的 Android 设备（ARM64 / ARMv7）上，直接下载预编译二进制执行：
+```bash
+# 下载最新 Android aarch64 静态单文件二进制
+curl -fL https://github.com/GentlemanHu/gdirect/releases/latest/download/gdirect-0.9.0-aarch64-linux-android.tar.gz | tar -xz
+chmod +x gdirect
+
+# 启动流媒体网关服务
+./gdirect serve --host 0.0.0.0 --port 8090
 ```
 
-## 安装
+### 3. 主机独立运行（Linux / macOS / Windows）
 
-预编译包支持以下平台：
+直接从 [GitHub Releases](https://github.com/GentlemanHu/gdirect/releases) 下载对应平台的打包文件，或一键运行：
+```bash
+# 启动流媒体网关及管理面板（默认 8080 端口）
+./gdirect serve --port 8080
 
-- macOS 15+（Apple Silicon / Intel）
-- Linux x86_64，glibc 2.35+（Ubuntu 22.04+、Debian 12+ 及较新的 Fedora/Arch/openSUSE）
-- Windows x86_64
-
-Alpine/musl、旧版 glibc 和 Linux ARM64 需要[从源码编译](#从源码编译)。
-
-macOS / Linux（需要 `curl`）：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mizorewww/gdirect/main/scripts/install.sh | bash
+# 携带 Master API Key 进行全局访问鉴权
+./gdirect serve --port 8080 --api-key my-secure-token
 ```
 
-Windows PowerShell：
+---
 
-```powershell
-& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/mizorewww/gdirect/main/scripts/install.ps1')))
+## 客户端与媒体库接入
+
+### 1. OpenList 挂载配置 (WebDAV 302 零中转)
+- **驱动类型**：`WebDAV`
+- **WebDAV 地址**：`http://<网关IP>:<端口>/webdav/`
+- **Web 代理开关**：**必须关闭**（关闭后 OpenList 触发 302 客户端直连机制，避免流量在 OpenList 服务器重复中转）
+- **账号/密码**：若网关未设置 `--api-key`，任意输入即可。
+
+### 2. Emby / Jellyfin 媒体库无盘直刮 (.strm)
+1. 访问 gdirect 控制台进入【协议接入】&rarr;【Emby / Jellyfin】；
+2. 输入影视根目录 ID（默认 `root`）与网关公网访问基地址，点击下载 `.strm` ZIP 媒体压缩包；
+3. 解压到 Emby 媒体目录，在 Emby 后台添加媒体库并开启“Direct Play 原画直解”，实现 5TB 影视无盘海报墙。
+
+### 3. 第三方播放器一键唤醒
+在 Web 播放器右上角或底部控制栏，点击【外部播放器】，支持一键唤起：
+- **iOS / macOS**：Infuse (`infuse://`)、IINA (`iina://`)、VLC (`vlc://`)
+- **Android**：MX Player (`intent://`)、nPlayer (`nplayer-http://`)
+- **Windows**：PotPlayer (`potplayer://`)、VLC
+
+---
+
+## 工作原理与安全架构
+
+| 流量类型 | 调度通道 | 安全与说明 |
+| --- | --- | --- |
+| **视频流 / 下载 / 上传 / 令牌刷新** (`serve`、`browse`、`download`、`upload`) | 直连扫描优选的 Google 边缘 IP | 端到端 TLS 加密，内置 Google GTS 根证书强制比对校验。遭遇 SNI 阻断时自动改用伪造身份 (`g.cn` TLS 握手，Host 保持真实主机)。完全不消耗梯子流量。 |
+| **OAuth 授权登录** (`accounts.google.com`、`oauth2.googleapis.com`) | 系统网络（系统 DNS / 代理） | 仅在初次授权时交互数 KB 数据。支持在电脑端完成授权后，将 `authorized_user` JSON 一键粘贴至 Web 控制台导入。 |
+| **文件系统挂载** (`gdirect mount`) | 系统网络 (rclone FUSE) | 传统本地虚拟磁盘挂载接口。 |
+
+> **注意**：如果本地开启了全局 TUN 模式代理（如 Clash TUN），请确保将 Google 直连 IP 设为 **DIRECT**，避免真实链路测速失真。
+
+---
+
+## 编译与构建
+
+### 1. 前端构建
+```bash
+cd web
+npm install
+npm run build
 ```
 
-安装脚本会把 gdirect 放到 `~/.local/bin`（Windows 为 `%LOCALAPPDATA%\gdirect\bin`），并提示如何加入 PATH。Windows 装完后请重新打开终端。
+### 2. 后端构建
+```bash
+# 构建全功能版（集成 Web 控制台）
+cargo build --release
 
-要使用挂载功能，在命令末尾加 `--with-mount`（PowerShell 用 `-WithMount`），脚本会顺带安装依赖：
-
-- 所有平台都会安装 rclone 1.75.2+。
-- Linux 还会通过包管理器安装 FUSE3，需要 sudo。
-- Windows 通过 winget 安装 rclone 和 WinFsp，安装 WinFsp 时可能弹出管理员授权。
-
-Homebrew（macOS / Linux）：
-
-```sh
-brew tap mizorewww/gdirect https://github.com/mizorewww/gdirect
-brew install mizorewww/gdirect/gdirect
-brew install rclone   # 仅挂载需要；Linux 还要用发行版的包管理器安装 fuse3
+# 构建纯 CLI / Headless 版（无前端，体积超小）
+cargo build --release --no-default-features
 ```
 
-升级可以执行 `brew update && brew upgrade gdirect`，也可以重新运行安装脚本。
-
-也可以直接下载 [Release 安装包](https://github.com/mizorewww/gdirect/releases/latest)。证书校验内置了 Google 自己的 GTS 根证书，无需另外放置 CA 文件。
-
-## 一次性配置 Google（约 10 分钟）
-
-gdirect 不提供共用的 Google 客户端，需要你在自己的 Google Cloud 项目里创建一个，只需做一次。按照 [Google 配置指南](docs/configuration/README.zh-CN.md)下载 **Desktop app（桌面应用）** 类型的 OAuth 客户端 JSON，然后执行：
-
-```sh
-gdirect login --client-secret ~/Downloads/client_secret.json
+### 3. 交叉编译 Android NDK
+通过 `.cargo/config.toml` 配置 NDK 路径后：
+```bash
+cargo ndk --target aarch64-linux-android --platform 24 build --release --bin gdirect
 ```
 
-浏览器会自动打开，授权完成后终端显示 `Logged in`。之后就不再需要这个 JSON 文件了。
+---
 
-## 日常使用
+## 开源协议
 
-```sh
-gdirect                                   # 等同于 gdirect browse
-gdirect browse -o ~/Downloads             # 下载目录（默认 ./downloads）
-gdirect ls root --json
-gdirect download 文件ID或分享链接          # 保存到 ./downloads/<文件名>
-gdirect download FILE_ID -o file.zip
-gdirect download DOC_ID --export application/pdf -o doc.pdf
-gdirect upload ./file.zip
-gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
-```
-
-`browse` 仿照 [yazi](https://github.com/sxyazi/yazi)，并排显示上级文件夹、当前文件夹和预览。按 `?` 查看全部按键。
-
-| `browse` 中的按键 | 操作 |
-| --- | --- |
-| `j/k`、`↑/↓` | 选择 |
-| `g/G`、Home/End | 跳到第一项 / 最后一项 |
-| `Ctrl-d/Ctrl-u`、PgDn/PgUp | 向下或向上翻半页 / 一页 |
-| Enter、`l/→` | 进入文件夹 |
-| `h/←`、Backspace | 返回上级 |
-| `/` | 按名称筛选当前文件夹。Enter 保留筛选，Esc 清除 |
-| `Ctrl-r`、F5 | 刷新 |
-| 空格 | 标记或取消标记；切换文件夹后标记仍保留 |
-| `Ctrl-a` | 标记当前显示的所有项目（再按一次取消） |
-| Esc | 依次清除筛选、标记、剪贴板 |
-| `a` | 新建空文件；名称以 `/` 结尾则新建文件夹 |
-| `r` | 重命名 |
-| `y` / `x` | 复制 / 剪切已标记的项目（没有标记时为当前选中的项目） |
-| `p` | 粘贴到当前文件夹。剪切的项目会被移动，复制的文件会生成副本（Drive 不支持复制文件夹） |
-| `D`、Delete | 把已标记的项目（没有标记时为当前选中的项目）移到 Drive 回收站（会先确认） |
-| `u` | 上传本地文件到当前文件夹 |
-| `d` | 把已标记的项目（没有标记时为当前选中的项目）加入下载队列。文件夹会连同所有子文件夹一起下载到 `<下载目录>/<文件夹名>/`；Google 文档、表格、幻灯片导出为 PDF |
-| `+/-` | 调整下一个下载的连接数（1–16），并保存为默认值 |
-| `c` | 取消当前下载并保留已下载部分 |
-| `R` | 重试失败或已取消的下载 |
-| `X` | 移除尚未开始的下载 |
-| `q` | 退出 |
-
-- **队列：** 下载逐个进行。文件列表会显示每个文件的状态（◦ 排队、↓ 下载中、✓ 已保存、✗ 失败），下载面板显示整体进度。选中失败的文件可以看到完整错误。同一会话中同名的文件会保存为 `name (2).ext`。
-- **续传：** 下载或上传中断后，重新执行同一条命令即可接着传。
-- **下载：** 已经下载完成的文件会按校验和识别出来，提示已下载。每次下载完成后都会与 Drive 记录的 MD5 比对。
-- **上传：** 总是新建文件，不会覆盖云端的同名文件。
-- **连接数：** `-j N` 只对当前这条命令生效。保存的默认值（初始为 8）只能在 `browse` 里用 `+/-` 修改。
-
-`download` 和 `browse` 支持以下高级传输选项（`ls`、`upload` 只支持 `--ip`）：
-
-| 选项 | 说明 |
-| --- | --- |
-| `--ip IP` | 指定 Google IP，不使用扫描结果 |
-| `--sni HOST` / `--no-sni` | 发送其他 TLS SNI，或不发送 SNI。证书仍按真实主机名校验 |
-| `--ca-cert FILE` | 用指定的 CA 证书包代替内置的 Google GTS 根证书 |
-| `--export MIME` | （`download`）导出 Google 文档，例如 `application/pdf` |
-
-`gdirect scan` 会重新扫描，`gdirect scan --list` 查看扫描结果，其中包括每个 IP 最近一次的错误。要测试自己找到的候选 IP，可以执行 `gdirect scan --ips FILE`：文件中每行写一个公网 IP，`#` 后面是注释。不在 Google IP 段内的地址也可以用，但会标为 `[third-party relay]`：这类服务器读不到你的流量（证书仍按 Google 根证书校验），但能看到你的 IP，以及在不用伪造身份时你访问的是哪个 Google 主机。
-
-写脚本时可以用 `GDIRECT_ACCESS_TOKEN` 直接提供访问令牌，不必登录（`mount` 仍然需要先 `gdirect login`）。
-
-
-## 多账号
-
-用同一个 OAuth 客户端登录更多 Google 账号：
-
-```sh
-gdirect login --add                # 在浏览器里选择另一个账号
-gdirect accounts                   # * 表示默认账号
-gdirect switch work                # 把 work@… 设为默认账号
-gdirect -a me@gmail.com browse     # 只在这一条命令里使用某个账号
-gdirect logout work                # 退出一个账号（--all 退出全部）
-```
-
-所有命令都接受 `-a`/`--account`，值可以是完整邮箱，也可以是不会混淆的前缀；在 shell 或脚本里可以用 `GDIRECT_ACCOUNT` 设置。最近一次登录的账号会成为默认账号，`browse` 的标题栏会显示当前账号。每个账号有各自的文件夹缓存和上传会话，也可以同时挂载（各用一个目录）。OAuth 应用处于测试状态时，每个账号都要加为测试用户（见[第 5 步](docs/configuration/google-cloud.zh-CN.md#5-允许你的账号登录)）。
-
-## 挂载
-
-挂载需要先通过 `--with-mount` 或上面的 Homebrew 步骤装好依赖。
-
-```sh
-gdirect mount                        # 挂到 ~/GoogleDrive
-gdirect mount ~/MyDrive --read-only
-gdirect unmount
-```
-
-- macOS 使用系统自带的 NFS，不需要 FUSE 驱动；Linux 使用 FUSE3。
-- Windows 在前台运行，按 Ctrl-C 停止。
-- macOS/Linux 的挂载目录必须为空；Windows 的挂载目录必须是还不存在的路径。
-- 写入的文件先进本地缓存，再在后台上传。缓存会尽量控制在 5 GiB 以内，但正在使用或尚未上传的文件可能让它超出。`mount` 会打印日志路径，日志里出现 `to upload 0, uploading 0` 就说明上传已经完成。
-- `unmount` 会保留还没上传的文件，下次 `mount` 时继续上传。
-- `mount -a 账号` 挂载其他账号。`unmount` 会卸载默认账号的挂载或唯一的挂载；有多个挂载时加上 `-a 账号`。
-- `-j` 控制 rclone 同时进行的传输数。
-
-## 本地数据与退出登录
-
-凭据、扫描到的 IP 和设置都保存在一个私有的 SQLite 文件中：
-
-- macOS：`~/Library/Application Support/gdirect/state.sqlite3`
-- Linux：`~/.local/share/gdirect/state.sqlite3`
-- Windows：`%LOCALAPPDATA%\gdirect\state.sqlite3`
-
-可以用 `--db PATH` 指定其他文件。`gdirect logout` 会删除默认账号（或你指定的账号；`--all` 表示全部账号）已保存的凭据，保留扫描结果；退出某个账号前请先卸载它的挂载。添加或切换 Google 账号见[多账号](#多账号)。
-
-登录失败、7 天过期等问题请看[常见问题](docs/configuration/README.zh-CN.md#常见问题)。
-
-## 从源码编译
-
-需要 Rust 1.91+、C++ 编译器、make、curl 和 OpenSSL 3。
-
-```sh
-git clone https://github.com/mizorewww/gdirect.git
-cd gdirect
-# macOS：brew install openssl@3
-# Debian / Ubuntu：sudo apt-get install build-essential pkg-config libssl-dev ca-certificates curl xz-utils
-./scripts/build-libaria2.sh
-cargo install --path . --locked
-```
-
-Windows 需要使用 MinGW GNU 工具链编译，步骤如下：
-
-1. 在 MSYS2 的 MINGW64 终端中安装依赖：`make patch tar xz mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-pkgconf`。
-2. 执行 `rustup target add x86_64-pc-windows-gnu`。
-3. 设置环境变量 `OPENSSL_PREFIX=$(cygpath -m /mingw64)`。
-4. 执行上面的两条构建命令，并给 `cargo install` 加上 `--target x86_64-pc-windows-gnu`。
+本项目采用 [GPL-2.0-or-later](LICENSE) 开源许可证。
