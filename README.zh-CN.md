@@ -2,6 +2,10 @@
 
 [English](README.md) · [Releases 预编译下载](https://github.com/GentlemanHu/gdirect/releases) · [更新日志](CHANGELOG.md) · [项目说明文档](文件说明.md)
 
+<p align="center">
+  <img src="docs/images/gdirect-preview.gif" alt="gdirect 演示" width="100%">
+</p>
+
 gdirect 是面向 Google 云盘（Google Drive）的高性能网络直连传输与私有流媒体网关系统。通过就近探测并绑定中国大陆可连通的 Google 官方边缘 IP（结合 SNI 伪装技术），绕过限速与阻断，让数 TB 的影视与大文件跑满本地物理带宽。
 
 针对云盘大容量媒体播放痛点，系统深度重构了流式传输层，内嵌现代化 React 19 单页管理控制台与影院级双字幕播放器，原生支持 WebDAV 302 重定向直连与 Emby/Jellyfin `.strm` 无盘直解。
