@@ -222,11 +222,8 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
               <div>
                 <h3 className="text-base font-semibold text-white">
-                  全局鉴权 API Key
+                  API Key
                 </h3>
-                <p className="text-xs text-slate-400">
-                  若服务器启动时设置了 GDIRECT_API_KEY，需在此输入以访问
-                </p>
               </div>
             </div>
 
