@@ -1,0 +1,22 @@
+services:
+  gdirect:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gdirect-gateway
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+      - GDIRECT_HOST=0.0.0.0
+      - GDIRECT_API_KEY=${GDIRECT_API_KEY:-}
+      - GDIRECT_ACCOUNT=${GDIRECT_ACCOUNT:-}
+      - GDIRECT_GOOGLE_ONLY=${GDIRECT_GOOGLE_ONLY:-false}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

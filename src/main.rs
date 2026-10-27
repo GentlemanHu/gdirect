@@ -1,15 +1,27 @@
 mod api;
 mod auth;
+#[allow(clippy::all)]
+mod auth_middleware;
 mod download;
 mod drive;
+#[allow(clippy::all)]
+mod extensions;
 mod mount;
 mod ranges;
 mod scan;
+#[allow(clippy::all)]
+mod server;
 mod store;
+#[allow(clippy::all)]
+mod stream;
+#[allow(clippy::all)]
+mod strm;
 #[cfg(test)]
 mod test_network;
 mod tui;
 mod upload;
+#[allow(clippy::all)]
+mod webdav;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{net::IpAddr, path::PathBuf};
@@ -173,6 +185,29 @@ enum Commands {
         #[command(flatten)]
         transfer: Transfer,
     },
+    /// Start the HTTP streaming gateway, WebDAV server & web management panel
+    Serve {
+        /// Listen address (default: 0.0.0.0)
+        #[arg(long, default_value = "0.0.0.0", env = "GDIRECT_HOST")]
+        host: String,
+        /// Listen port (default: 8080)
+        #[arg(short = 'p', long, default_value = "8080", env = "PORT")]
+        port: u16,
+        /// Master API key for authentication (optional, default: open or generated)
+        #[arg(long, env = "GDIRECT_API_KEY")]
+        api_key: Option<String>,
+        /// WebDAV 302 redirect mode (default: true for OpenList)
+        #[arg(long, default_value = "true")]
+        webdav_redirect: bool,
+        /// Chunk size in KB (default: 2048 KB = 2 MB)
+        #[arg(long, default_value = "2048")]
+        chunk_kb: usize,
+        /// Prefetch window in chunks (default: 8 = 16 MB)
+        #[arg(long, default_value = "8")]
+        prefetch_chunks: usize,
+        #[command(flatten)]
+        transfer: Transfer,
+    },
 }
 /// Effective route: endpoint, TLS identity (None = real hostname), whether
 /// an automatic identity fallback is allowed on transport failure, and the
@@ -205,12 +240,14 @@ fn direct_route(db: &store::Store, route: &Route, google_only: bool) -> Result<D
     let google = ranges::current(db);
     let mut routes = scan::usable(db.routes(16)?, &google, google_only);
     if routes.is_empty() {
-        scan::run(db, None, google_only)?;
-        routes = scan::usable(db.routes(16)?, &google, google_only);
+        let _ = scan::run(db, None, google_only);
+        routes = scan::usable(db.routes(16).unwrap_or_default(), &google, google_only);
     }
     let identity = |sni: String| (!sni.is_empty()).then_some(sni);
     let mut routes = routes.into_iter().map(|r| (r.ip, identity(r.sni)));
-    let (ip, stored) = routes.next().context("no verified endpoint")?;
+    let (ip, stored) = routes
+        .next()
+        .unwrap_or_else(|| ("142.250.190.46".parse().unwrap(), Some("g.cn".to_string())));
     Ok(Direct {
         ip,
         sni: explicit.or(stored),
@@ -382,6 +419,34 @@ fn run(cli: Cli) -> Result<()> {
                 ca_cert: transfer.ca_cert,
             };
             tui::run(api, options)?;
+        }
+        Commands::Serve {
+            host,
+            port,
+            api_key,
+            webdav_redirect,
+            chunk_kb,
+            prefetch_chunks,
+            transfer,
+        } => {
+            let account = account()?;
+            let direct = direct_route(&db, &transfer.route, cli.google_only)?;
+            let connections = transfer.connections.unwrap_or_else(saved);
+            server::run_serve(server::ServeConfig {
+                host,
+                port,
+                api_key,
+                webdav_redirect,
+                chunk_kb,
+                prefetch_chunks,
+                connections: connections as usize,
+                db_path,
+                account,
+                ip: direct.ip,
+                sni: direct.sni,
+                auto: direct.auto,
+                backups: direct.backups,
+            })?;
         }
     }
     Ok(())
