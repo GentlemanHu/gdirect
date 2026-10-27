@@ -22,7 +22,5 @@ service-logs/
 .cargo/
 .cloudflare/
 
-# Promo and animations (private, not open-sourced)
+# Promo animation composition & sources (private, not open-sourced)
 docs/onetake-promo/
-docs/images/
-*.mp4

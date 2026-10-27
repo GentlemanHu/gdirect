@@ -2,6 +2,10 @@
 
 [中文说明](README.zh-CN.md) · [Releases & Prebuilts](https://github.com/GentlemanHu/gdirect/releases) · [Changelog](CHANGELOG.md) · [Documentation](文件说明.md)
 
+<p align="center">
+  <img src="docs/images/gdirect-preview.gif" alt="gdirect Preview" width="100%">
+</p>
+
 gdirect is an advanced Google Drive streaming gateway and high-throughput transfer system. By scanning, benchmarking, and binding reachable Google edge frontend IP addresses (with built-in TLS SNI identity forging), it routes petabyte-scale Drive traffic directly over optimal edge endpoints, fully saturating physical local bandwidth without censorship throttling.
 
 Engineered specifically for cloud media streaming and multi-device access, gdirect integrates an embedded React 19 single-page administration console, a cinema-grade dual-subtitle video player, native WebDAV 302/206 streaming, and Emby/Jellyfin `.strm` zero-disk playback.
