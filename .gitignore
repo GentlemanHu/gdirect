@@ -3,6 +3,7 @@
 *.aria2
 .env
 .env.*
+!.env.example
 /local/
 
 *.sqlite3
@@ -13,3 +14,10 @@
 __pycache__/
 
 /dist/
+web/node_modules/
+web/.impeccable/
+.DS_Store
+*.log
+service-logs/
+.cargo/
+.cloudflare/

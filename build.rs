@@ -1,13 +1,18 @@
 use std::{env, path::PathBuf, process::Command};
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(without_aria2)");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let prefix = root.join("target/libaria2");
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let static_ssl = env::var("OPENSSL_STATIC").as_deref() == Ok("1");
-    assert!(
-        prefix.join("lib/libaria2.a").exists(),
-        "Run ./scripts/build-libaria2.sh first (pinned aria2 1.37.0)"
-    );
+    let lib_aria2 = prefix.join("lib/libaria2.a");
+    if !lib_aria2.exists() {
+        println!("cargo:rustc-cfg=without_aria2");
+        println!(
+            "cargo:warning=libaria2.a not found in target/libaria2/lib. Building without aria2 C++ bridge; native streaming & download engine enabled."
+        );
+        return;
+    }
     let mut bridge = cc::Build::new();
     bridge
         .cpp(true)

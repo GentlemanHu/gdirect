@@ -64,6 +64,7 @@ extern "C" fn on_progress(
     });
     i32::from(p.cancel.load(Ordering::Relaxed))
 }
+#[cfg(not(without_aria2))]
 unsafe extern "C" {
     fn gdirect_download_ex(
         url: *const std::ffi::c_char,
@@ -78,6 +79,27 @@ unsafe extern "C" {
         data: *mut std::ffi::c_void,
         signals: bool,
     ) -> i32;
+}
+
+#[cfg(without_aria2)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gdirect_download_ex(
+    _url: *const std::ffi::c_char,
+    _dir: *const std::ffi::c_char,
+    _name: *const std::ffi::c_char,
+    _ip: *const std::ffi::c_char,
+    _sni: *const std::ffi::c_char,
+    _token: *const std::ffi::c_char,
+    _ca: *const std::ffi::c_char,
+    _connections: i32,
+    _callback: Option<extern "C" fn(i64, i64, i32, i32, *mut std::ffi::c_void) -> i32>,
+    _data: *mut std::ffi::c_void,
+    _signals: bool,
+) -> i32 {
+    eprintln!(
+        "Warning: libaria2 was not compiled. Please use the built-in streaming gateway or build libaria2."
+    );
+    -1
 }
 
 pub fn allowed_url(url: &Url) -> bool {

@@ -66,7 +66,8 @@ jobs:
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - run: python3 tests/native_integration.py
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build full binary (with web console)
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Check portable linkage
         shell: bash
         env:
@@ -79,7 +80,12 @@ jobs:
             ldd "target/$TARGET/release/gdirect" | tee /tmp/dependencies.txt
             if grep -E 'lib(ssl|crypto)' /tmp/dependencies.txt; then exit 1; fi
           fi
-      - run: python3 scripts/package-release.py --target ${{ matrix.target }}
+      - name: Package full release
+        run: python3 scripts/package-release.py --target ${{ matrix.target }} --flavor full
+      - name: Build cli-only binary (headless, without web console)
+        run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
+      - name: Package cli-only release
+        run: python3 scripts/package-release.py --target ${{ matrix.target }} --flavor cli
       - name: Test Unix installer and mount dependencies
         if: hashFiles('scripts/install.sh') != ''
         run: python3 tests/installer_integration.py --target ${{ matrix.target }} --with-mount
@@ -139,7 +145,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - shell: msys2 {0}
         run: python tests/native_integration.py
-      - shell: msys2 {0}
+      - name: Build Windows full binary
+        shell: msys2 {0}
         run: cargo build --release --locked
       - name: Check portable linkage
         shell: msys2 {0}
@@ -147,8 +154,15 @@ jobs:
           set -euo pipefail
           objdump -p target/x86_64-pc-windows-gnu/release/gdirect.exe | grep 'DLL Name:' | tee /tmp/dependencies.txt
           if grep -Ei 'libgcc|libstdc|libwinpthread|libssl|libcrypto|msys-' /tmp/dependencies.txt; then exit 1; fi
-      - shell: msys2 {0}
-        run: python scripts/package-release.py --target x86_64-pc-windows-gnu
+      - name: Package Windows full release
+        shell: msys2 {0}
+        run: python scripts/package-release.py --target x86_64-pc-windows-gnu --flavor full
+      - name: Build Windows cli-only binary
+        shell: msys2 {0}
+        run: cargo build --release --locked --no-default-features
+      - name: Package Windows cli-only release
+        shell: msys2 {0}
+        run: python scripts/package-release.py --target x86_64-pc-windows-gnu --flavor cli
       - name: Test Windows installer
         if: hashFiles('scripts/install.ps1') != ''
         shell: pwsh
@@ -175,9 +189,54 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  android:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            ndk_platform: 24
+          - target: armv7-linux-androideabi
+            ndk_platform: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: nwtgck/actions-setup-ndk@v1
+        with:
+          ndk-version: r26b
+          link-to-sdk: true
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build Android full binary (with web console)
+        run: cargo ndk --target ${{ matrix.target }} --platform ${{ matrix.ndk_platform }} build --release --locked --bin gdirect
+      - name: Package Android full release
+        run: python3 scripts/package-release.py --target ${{ matrix.target }} --flavor full
+      - name: Build Android cli-only binary (headless)
+        run: cargo ndk --target ${{ matrix.target }} --platform ${{ matrix.ndk_platform }} build --release --locked --no-default-features --bin gdirect
+      - name: Package Android cli-only release
+        run: python3 scripts/package-release.py --target ${{ matrix.target }} --flavor cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish complete release
-    needs: [unix, windows]
+    needs: [unix, windows, android]
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
     runs-on: ubuntu-22.04
     permissions:
@@ -202,10 +261,18 @@ jobs:
           import os, pathlib, tomllib
           version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
           assert os.environ['TAG'] == f'v{version}', 'Tag must match Cargo.toml version'
-          targets = ['x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-gnu']
+          targets = [
+              'x86_64-unknown-linux-gnu',
+              'aarch64-apple-darwin',
+              'x86_64-apple-darwin',
+              'x86_64-pc-windows-gnu',
+              'aarch64-linux-android',
+              'armv7-linux-androideabi',
+          ]
           for target in targets:
               ext = 'zip' if 'windows' in target else 'tar.gz'
-              assert pathlib.Path(f'dist/gdirect-{version}-{target}.{ext}').is_file()
+              assert pathlib.Path(f'dist/gdirect-{version}-{target}.{ext}').is_file(), f'Missing full asset for {target}'
+              assert pathlib.Path(f'dist/gdirect-cli-{version}-{target}.{ext}').is_file(), f'Missing cli asset for {target}'
           PY
           cd dist
           cat ./*.sha256 | tr -d '\r' > SHA256SUMS
