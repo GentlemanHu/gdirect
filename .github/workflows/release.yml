@@ -211,12 +211,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: nwtgck/actions-setup-ndk@v1
+      - name: Locate or Setup Android NDK
+        uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
           link-to-sdk: true
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: |
+          cargo install cargo-ndk --locked
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
