@@ -98,14 +98,17 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [bufferedPercent, setBufferedPercent] = useState(0);
   const [bufferedAheadSecs, setBufferedAheadSecs] = useState(0);
-  const [isBuffering, setIsBuffering] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(true);
+  const [hasPlayedFirstFrame, setHasPlayedFirstFrame] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Error & External Player State
+  // Error & Resilient Recovery State
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isReconnecting, setIsReconnecting] = useState(false);
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [retryCount, setRetryCount] = useState<number>(0);
+  const [retryCountdown, setRetryCountdown] = useState<number | null>(null);
+  const retryTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [showExternalModal, setShowExternalModal] = useState(false);
   const [useOfficial302, setUseOfficial302] = useState(false);
 
@@ -232,9 +235,51 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return playQueue.findIndex((item) => item.id === file.id);
   }, [playQueue, file.id]);
 
+  // Device & Platform Detection
+  const isIOS = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+  }, []);
+
+  const isMobile = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return (
+      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+      (typeof window !== 'undefined' && window.innerWidth < 768)
+    );
+  }, []);
+
   // Real-time speed from backend
   const [streamSpeedMbps, setStreamSpeedMbps] = useState<string>('0.0');
-  const lastSpeedPollRef = useRef<number>(0);
+
+  // Active real-time stream bandwidth polling (runs even during initial buffer / stalls)
+  useEffect(() => {
+    let active = true;
+    const pollSpeed = () => {
+      fetch('/api/sessions')
+        .then((r) => r.json())
+        .then((sessList: StreamSession[]) => {
+          if (!active) return;
+          const match = sessList.find((s) => s.file_id === file.id);
+          if (match && match.speed_kbps > 0) {
+            setStreamSpeedMbps(((match.speed_kbps * 8) / 1024).toFixed(1));
+          } else {
+            setStreamSpeedMbps('0.0');
+          }
+        })
+        .catch(() => {});
+    };
+
+    pollSpeed();
+    const timer = setInterval(pollSpeed, 1500);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [file.id]);
 
   const key = localStorage.getItem('gdirect_api_key');
   const tokenParam = key ? `?token=${encodeURIComponent(key)}` : '';
@@ -621,6 +666,30 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   };
 
   // Playback & Buffer Tracking + Progress Memory
+  const updateBufferInfo = useCallback(() => {
+    if (!videoRef.current) return;
+    const v = videoRef.current;
+    const curr = v.currentTime;
+    const dur = v.duration;
+    const buf = v.buffered;
+    if (buf.length > 0) {
+      let found = false;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf.start(i) <= curr && curr <= buf.end(i)) {
+          if (dur > 0) setBufferedPercent((buf.end(i) / dur) * 100);
+          setBufferedAheadSecs(Math.max(0, Math.round(buf.end(i) - curr)));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        const lastEnd = buf.end(buf.length - 1);
+        if (dur > 0) setBufferedPercent((lastEnd / dur) * 100);
+        setBufferedAheadSecs(Math.max(0, Math.round(lastEnd - curr)));
+      }
+    }
+  }, []);
+
   const handleTimeUpdate = () => {
     if (!videoRef.current) return;
     const curr = videoRef.current.currentTime;
@@ -635,33 +704,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       }
     }
 
-    const buf = videoRef.current.buffered;
-    if (buf.length > 0 && duration > 0) {
-      for (let i = 0; i < buf.length; i++) {
-        if (buf.start(i) <= curr && curr <= buf.end(i)) {
-          setBufferedPercent((buf.end(i) / duration) * 100);
-          setBufferedAheadSecs(Math.max(0, Math.round(buf.end(i) - curr)));
-          break;
-        }
-      }
-    }
-
-    // Poll live stream speed
-    const now = Date.now();
-    if (now - lastSpeedPollRef.current >= 2000) {
-      lastSpeedPollRef.current = now;
-      fetch('/api/sessions')
-        .then((r) => r.json())
-        .then((sessList: StreamSession[]) => {
-          const match = sessList.find((s) => s.file_id === file.id);
-          if (match && match.speed_kbps > 0) {
-            setStreamSpeedMbps(((match.speed_kbps * 8) / 1024).toFixed(1));
-          } else {
-            setStreamSpeedMbps('0.0');
-          }
-        })
-        .catch(() => {});
-    }
+    updateBufferInfo();
   };
 
   // Video Ended -> Intelligent Queue Next
@@ -818,15 +861,119 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }
   };
 
+  const enterNativeSystemPlayer = () => {
+    if (!videoRef.current) return;
+    const v = videoRef.current as any;
+    try {
+      if (typeof v.webkitEnterFullscreen === 'function') {
+        v.webkitEnterFullscreen();
+        showToast('唤起系统原生播放器');
+      } else if (v.requestFullscreen) {
+        v.requestFullscreen().catch(() => {});
+      }
+    } catch (e) {
+      console.warn('Native player launch error:', e);
+    }
+  };
+
   const togglePiP = async () => {
     if (!videoRef.current) return;
+    const v = videoRef.current as any;
     try {
+      // 1. WebKit Presentation Mode (iOS Safari standard Picture-in-Picture)
+      if (typeof v.webkitSetPresentationMode === 'function') {
+        const currentMode = v.webkitPresentationMode;
+        const targetMode = currentMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture';
+        v.webkitSetPresentationMode(targetMode);
+        showToast(targetMode === 'picture-in-picture' ? '进入画中画' : '退出画中画');
+        return;
+      }
+      // 2. Standard W3C Picture-in-Picture API
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
+        showToast('退出画中画');
+      } else if (v.requestPictureInPicture) {
+        await v.requestPictureInPicture();
+        showToast('进入画中画');
+      } else if (typeof v.webkitEnterFullscreen === 'function') {
+        v.webkitEnterFullscreen();
       } else {
-        await videoRef.current.requestPictureInPicture();
+        setIsFloating((prev) => !prev);
+        showToast(isFloating ? '全屏展开' : '页面悬浮小窗');
       }
-    } catch {}
+    } catch (err) {
+      console.warn('PiP failed, falling back:', err);
+      if (typeof v.webkitEnterFullscreen === 'function') {
+        v.webkitEnterFullscreen();
+      } else {
+        setIsFloating((prev) => !prev);
+      }
+    }
+  };
+
+  // Resilient Stream Reload & Error Recovery
+  const performStreamReload = (switchRoute = false) => {
+    if (retryTimerRef.current) clearInterval(retryTimerRef.current);
+    setRetryCountdown(null);
+    setVideoError(null);
+    setIsReconnecting(false);
+    setIsBuffering(true);
+
+    if (switchRoute) {
+      const next302 = !useOfficial302;
+      setUseOfficial302(next302);
+      showToast(next302 ? '已切换至官方 302 线路' : '已切换至国内边缘直连');
+    } else {
+      showToast('正在重试视频流连接...');
+    }
+
+    const cur = currentTime || videoRef.current?.currentTime || 0;
+    setTimeout(() => {
+      if (videoRef.current) {
+        videoRef.current.load();
+        videoRef.current.currentTime = cur;
+        safePlay();
+      }
+    }, 250);
+  };
+
+  const handleVideoError = () => {
+    const err = videoRef.current?.error;
+    const code = err?.code;
+    console.warn('Video error detected:', code, err);
+
+    // Auto-retry up to 2 times before blocking with recovery card
+    if (retryCount < 2) {
+      setRetryCount((prev) => prev + 1);
+      setRetryCountdown(2);
+      setIsReconnecting(true);
+      setIsBuffering(true);
+
+      if (retryTimerRef.current) clearInterval(retryTimerRef.current);
+      let count = 2;
+      retryTimerRef.current = setInterval(() => {
+        count -= 1;
+        setRetryCountdown(count);
+        if (count <= 0) {
+          if (retryTimerRef.current) clearInterval(retryTimerRef.current);
+          setRetryCountdown(null);
+          performStreamReload(false);
+        }
+      }, 1000);
+      return;
+    }
+
+    let message = '网络流连接超时或缓冲中断，请立即重试或切换传输线路';
+    if (code === 4) {
+      message = '当前浏览器可能无法直接解码此格式，可切换官方 302 或外部播放器';
+    } else if (code === 3) {
+      message = '视频解码遇到错误，建议重试或切换为官方直链';
+    } else if (code === 2) {
+      message = '网络请求连接超时或中断';
+    }
+    setVideoError(message);
+    setIsReconnecting(false);
+    setRetryCountdown(null);
   };
 
   // Keyboard controls
@@ -1003,8 +1150,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             </button>
 
             {/* Rate & Buffer Pill */}
-            <div className="hidden md:flex px-2.5 py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-xs font-mono text-slate-300 items-center space-x-1.5">
-              <Zap className="w-3.5 h-3.5 text-cyan-400" />
+            <div className="flex px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-[10px] sm:text-xs font-mono text-slate-300 items-center space-x-1 sm:space-x-1.5">
+              <Zap className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-cyan-400" />
               <span>{streamSpeedMbps} Mbps</span>
               {bufferedAheadSecs > 0 && (
                 <span className="text-emerald-400 font-medium">+{bufferedAheadSecs}s</span>
@@ -1152,62 +1299,61 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             autoPlay
             preload="auto"
             playsInline
+            {...({ 'webkit-playsinline': 'true', 'x5-playsinline': 'true' } as any)}
+            onLoadStart={() => {
+              setIsBuffering(true);
+              setVideoError(null);
+            }}
             onTimeUpdate={handleTimeUpdate}
-            onSeeked={handleTimeUpdate}
-            onSeeking={handleTimeUpdate}
-            onLoadedData={() => {
+            onProgress={updateBufferInfo}
+            onSeeked={() => {
               handleTimeUpdate();
+              updateBufferInfo();
               setIsBuffering(false);
+            }}
+            onSeeking={() => {
+              setIsBuffering(true);
             }}
             onWaiting={() => {
               setIsBuffering(true);
             }}
+            onStalled={() => {
+              setIsBuffering(true);
+            }}
+            onLoadedData={() => {
+              handleTimeUpdate();
+              updateBufferInfo();
+              setIsBuffering(false);
+            }}
             onPlaying={() => {
               setIsPlaying(true);
               setIsBuffering(false);
+              setHasPlayedFirstFrame(true);
+              setVideoError(null);
+              setRetryCount(0);
+              setRetryCountdown(null);
             }}
             onCanPlay={() => {
               handleTimeUpdate();
+              updateBufferInfo();
               setIsBuffering(false);
               if (videoRef.current && videoRef.current.paused && !videoRef.current.ended) {
                 safePlay();
               }
             }}
             onEnded={handleVideoEnded}
-            onError={() => {
-              const err = videoRef.current?.error;
-              // Handle transient network drops (code 2 = MEDIA_ERR_NETWORK) - e.g. server hot reload
-              if (err?.code === 2) {
-                const cur = videoRef.current?.currentTime || 0;
-                setIsReconnecting(true);
-                showToast('网络连接中断，正在自动重连...');
-                if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-                reconnectTimerRef.current = setTimeout(() => {
-                  if (videoRef.current) {
-                    videoRef.current.load();
-                    videoRef.current.currentTime = cur;
-                    safePlay();
-                    setIsReconnecting(false);
-                  }
-                }, 2000);
-                return;
-              }
-
-              // Code 4: MEDIA_ERR_SRC_NOT_SUPPORTED
-              const msg = err?.code === 4
-                ? '浏览器不支持此视频的封装格式或音视频编码'
-                : '播放器连接异常，可尝试刷新或调用外部播放器';
-              setVideoError(msg);
-            }}
+            onError={handleVideoError}
             onLoadedMetadata={() => {
               setVideoError(null);
               setIsReconnecting(false);
+              setRetryCountdown(null);
               detectEmbeddedTracks();
               if (videoRef.current) {
                 const dur = videoRef.current.duration;
                 setDuration(dur);
                 setVideoWidth(videoRef.current.videoWidth);
                 setVideoHeight(videoRef.current.videoHeight);
+                updateBufferInfo();
 
                 // Check stored playback progress
                 const savedStr = localStorage.getItem(`gdirect_prog_${file.id}`);
@@ -1228,101 +1374,92 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 safePlay();
               }
             }}
-            onPlay={() => {
-              setIsPlaying(true);
-              setIsBuffering(false);
-            }}
             onPause={() => setIsPlaying(false)}
             className={`${videoFitClass} transition-all duration-200`}
           />
 
-          {/* Buffering Indicator */}
+          {/* Centered Buffering & Speed HUD */}
           {isBuffering && !videoError && (
             <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-20 animate-fade-in">
-              <div className="p-3 rounded-2xl bg-black/70 backdrop-blur-sm border border-slate-800 text-cyan-400 flex items-center space-x-2">
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                <span className="text-xs font-medium text-slate-200">缓冲中...</span>
+              <div className="p-4 sm:p-5 rounded-2xl bg-black/85 backdrop-blur-md border border-slate-800 shadow-2xl flex flex-col items-center space-y-2.5 min-w-[210px]">
+                <div className="relative flex items-center justify-center">
+                  <div className="w-10 h-10 rounded-full border-2 border-cyan-500/20 border-t-cyan-400 animate-spin" />
+                  <Zap className="w-4 h-4 text-cyan-400 absolute animate-pulse" />
+                </div>
+                <div className="text-center space-y-1">
+                  <div className="text-xs sm:text-sm font-semibold text-white tracking-wide">
+                    {isReconnecting
+                      ? `网络重连中 ${retryCountdown !== null ? `(${retryCountdown}s)` : '...'}`
+                      : !hasPlayedFirstFrame
+                      ? '连接边缘节点并建立流...'
+                      : '缓冲中...'}
+                  </div>
+                  <div className="flex items-center justify-center space-x-2 text-[10px] sm:text-xs font-mono text-slate-300">
+                    <span className="text-cyan-300 font-bold">{streamSpeedMbps} Mbps</span>
+                    <span className="text-slate-600">•</span>
+                    <span className="text-emerald-400 font-medium">+{bufferedAheadSecs}s 缓冲</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
-          {/* Reconnecting Toast */}
-          {isReconnecting && (
+          {/* Reconnecting Floating Toast */}
+          {isReconnecting && !isBuffering && (
             <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 px-3 py-1.5 rounded-full bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 text-xs font-medium flex items-center space-x-1.5 shadow-xl animate-fade-in">
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              <span>网络恢复重连中...</span>
+              <span>网络恢复重连中 {retryCountdown !== null ? `(${retryCountdown}s)` : ''}</span>
             </div>
           )}
 
-          {/* Video Error / Unsupported Format Card */}
+          {/* In-Player Resilient Recovery Card */}
           {videoError && (
             <div className="absolute inset-0 bg-black/90 backdrop-blur-md z-30 flex items-center justify-center p-4 animate-fade-in">
-              <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-2xl text-center">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mx-auto text-amber-400">
-                  <Film className="w-5 h-5" />
+              <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-6 space-y-4 shadow-2xl text-center">
+                <div className="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center mx-auto text-cyan-400">
+                  <RefreshCw className="w-6 h-6" />
                 </div>
-                <div>
-                  <h3 className="text-base font-bold text-white">无法直接解码此媒体</h3>
-                  <p className="text-xs text-slate-400 mt-1">
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-white">播放受阻或缓冲中断</h3>
+                  <p className="text-xs text-slate-400 leading-relaxed">
                     {videoError}
                   </p>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2 pt-1 text-xs font-medium">
-                  <a
-                    href={`vlc://${streamUrl}`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-orange-300 text-center block transition-colors"
-                  >
-                    VLC
-                  </a>
-                  <a
-                    href={`infuse://x-callback-url/open?url=${encodeURIComponent(streamUrl)}`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-amber-300 text-center block transition-colors"
-                  >
-                    Infuse
-                  </a>
-                  <a
-                    href={`intent:${streamUrl}#Intent;type=video/*;package=com.mxtech.videoplayer.ad;end`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-emerald-300 text-center block transition-colors"
-                  >
-                    MX Player
-                  </a>
-                  <a
-                    href={`iina://weblink?url=${encodeURIComponent(streamUrl)}`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-blue-300 text-center block transition-colors"
-                  >
-                    IINA
-                  </a>
-                  <a
-                    href={`nplayer-${streamUrl}`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-cyan-300 text-center block transition-colors"
-                  >
-                    nPlayer
-                  </a>
-                  <a
-                    href={`vidhub://play?url=${encodeURIComponent(streamUrl)}`}
-                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-purple-300 text-center block transition-colors"
-                  >
-                    VidHub
-                  </a>
-                </div>
+                <div className="space-y-2 pt-2">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => performStreamReload(false)}
+                      className="flex-1 py-2.5 px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold shadow-lg shadow-cyan-500/20 transition-all flex items-center justify-center space-x-1.5"
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      <span>立即重试</span>
+                    </button>
+                    <button
+                      onClick={() => performStreamReload(true)}
+                      className="flex-1 py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition-colors flex items-center justify-center space-x-1"
+                    >
+                      <Zap className="w-4 h-4 text-amber-400" />
+                      <span>切换为 {useOfficial302 ? '边缘直连' : '官方 302'}</span>
+                    </button>
+                  </div>
 
-                <div className="flex gap-2 pt-2">
+                  {isIOS && (
+                    <button
+                      onClick={enterNativeSystemPlayer}
+                      className="w-full py-2 px-3 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-cyan-300 text-xs font-semibold border border-cyan-500/30 transition-colors flex items-center justify-center space-x-1.5"
+                    >
+                      <Smartphone className="w-4 h-4" />
+                      <span>调用 iOS 系统原生播放器 (支持原生 PiP)</span>
+                    </button>
+                  )}
+
                   <button
-                    onClick={() => {
-                      setUseOfficial302(!useOfficial302);
-                      setVideoError(null);
-                      showToast(useOfficial302 ? '切回直连' : '已切换官方302');
-                    }}
-                    className="flex-1 py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold"
+                    onClick={() => setShowExternalModal(true)}
+                    className="w-full py-2 px-3 rounded-xl bg-slate-950/80 hover:bg-slate-800 text-slate-400 hover:text-white text-xs border border-slate-800 transition-colors flex items-center justify-center space-x-1.5"
                   >
-                    {useOfficial302 ? '切回直连' : '官方 302 重试'}
-                  </button>
-                  <button
-                    onClick={() => handleCopyUrl(streamUrl)}
-                    className="flex-1 py-2 px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-semibold"
-                  >
-                    {copyFeedback ? '已复制' : '复制直链'}
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>第三方播放器 (VLC / Infuse / IINA / MX)</span>
                   </button>
                 </div>
               </div>
@@ -2145,14 +2282,25 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 )}
               </div>
 
-              {/* Picture in Picture */}
+              {/* Picture in Picture (Mobile & Desktop) */}
               <button
                 onClick={togglePiP}
-                className="hidden sm:block p-2 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white transition-colors"
-                title="画中画"
+                className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white transition-colors"
+                title="画中画 (PiP)"
               >
-                <PictureInPicture className="w-4 h-4" />
+                <PictureInPicture className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
               </button>
+
+              {/* Native System Player for iOS / Mobile */}
+              {(isMobile || isIOS) && (
+                <button
+                  onClick={enterNativeSystemPlayer}
+                  className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-white/20 text-cyan-300 hover:text-white transition-colors"
+                  title="唤起系统原生播放器 (支持 iOS 原生 PiP/AirPlay)"
+                >
+                  <Smartphone className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                </button>
+              )}
 
               {/* Fullscreen */}
               <button
