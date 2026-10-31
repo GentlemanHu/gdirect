@@ -263,11 +263,11 @@ fn direct_route(db: &store::Store, route: &Route, google_only: bool) -> Result<D
         .map(|r| (r.ip, identity(r.sni)))
         .collect();
 
-    if let Some(pref) = preferred_ip {
-        if let Some(pos) = mapped_routes.iter().position(|(ip, _)| *ip == pref) {
-            let pref_item = mapped_routes.remove(pos);
-            mapped_routes.insert(0, pref_item);
-        }
+    if let Some(pos) =
+        preferred_ip.and_then(|pref| mapped_routes.iter().position(|(ip, _)| *ip == pref))
+    {
+        let pref_item = mapped_routes.remove(pos);
+        mapped_routes.insert(0, pref_item);
     }
 
     let mut routes = mapped_routes.into_iter();
