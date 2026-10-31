@@ -706,6 +706,33 @@ async fn api_auth_import(
         .into_response()
 }
 
+fn recover_best_api(state: &AppState) -> Option<Api> {
+    let db = Store::open(&state.db_path).ok()?;
+    let best = db.best_route().ok()??;
+    let current_account = state.api.read().unwrap().account.clone();
+    let google = crate::ranges::current(&db);
+    let backups: Vec<crate::api::Endpoint> = scan::usable(db.routes(16).unwrap_or_default(), &google, false)
+        .into_iter()
+        .filter(|r| r.ip != best.ip)
+        .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
+        .take(8)
+        .collect();
+
+    let new_api = Api::new(
+        state.db_path.clone(),
+        current_account,
+        Some(best.ip),
+        (!best.sni.is_empty()).then_some(best.sni.clone()),
+        true,
+    ).ok()?.with_backups(backups);
+
+    let _ = state.engine.client().switch_route(Some(best.ip), (!best.sni.is_empty()).then_some(best.sni));
+    if let Ok(mut lock) = state.api.write() {
+        *lock = new_api.clone();
+    }
+    Some(new_api)
+}
+
 #[derive(Deserialize)]
 struct DriveFilesQuery {
     folder: Option<String>,
@@ -717,20 +744,21 @@ async fn api_drive_files(
 ) -> impl IntoResponse {
     let folder = query.folder.unwrap_or_else(|| "root".into());
     let api = state.api_client();
+    let folder_clone = folder.clone();
 
-    let files = match tokio::task::spawn_blocking(move || api.list(&folder)).await {
+    let files = match tokio::task::spawn_blocking(move || api.list(&folder_clone)).await {
         Ok(Ok(files)) => files,
-        Ok(Err(e)) => {
+        _ => {
+            // Self-healing: if current endpoint failed or timed out, auto-failover to best verified route
+            if let Some(fallback_api) = recover_best_api(&state) {
+                let fld = folder.clone();
+                if let Ok(Ok(recovered_files)) = tokio::task::spawn_blocking(move || fallback_api.list(&fld)).await {
+                    return (StatusCode::OK, axum::Json(recovered_files)).into_response();
+                }
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": e.to_string()})),
+                axum::Json(serde_json::json!({"error": "Failed to list files. All direct endpoints failed."})),
             )
                 .into_response();
         }
@@ -753,20 +781,20 @@ async fn api_drive_search(
         return (StatusCode::OK, axum::Json(Vec::<crate::api::File>::new())).into_response();
     }
     let api = state.api_client();
+    let q_clone = q.clone();
 
-    let files = match tokio::task::spawn_blocking(move || api.search_files(&q)).await {
+    let files = match tokio::task::spawn_blocking(move || api.search_files(&q_clone)).await {
         Ok(Ok(files)) => files,
-        Ok(Err(e)) => {
+        _ => {
+            if let Some(fallback_api) = recover_best_api(&state) {
+                let q_str = q.clone();
+                if let Ok(Ok(recovered_files)) = tokio::task::spawn_blocking(move || fallback_api.search_files(&q_str)).await {
+                    return (StatusCode::OK, axum::Json(recovered_files)).into_response();
+                }
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": e.to_string()})),
+                axum::Json(serde_json::json!({"error": "Search failed. All direct endpoints failed."})),
             )
                 .into_response();
         }
@@ -933,19 +961,32 @@ async fn api_switch_route(
     }
     if let Ok(mut lock) = state.api.write() {
         let current_account = lock.account.clone();
+        let backups = if let Ok(db) = Store::open(&state.db_path) {
+            let google = crate::ranges::current(&db);
+            scan::usable(db.routes(16).unwrap_or_default(), &google, false)
+                .into_iter()
+                .filter(|r| Some(r.ip) != ip)
+                .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
+                .take(8)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if let Ok(new_api) = Api::new(
             state.db_path.clone(),
             current_account,
             ip,
             sni.clone(),
-            false,
+            true,
         ) {
-            *lock = new_api;
+            *lock = new_api.with_backups(backups);
         }
     }
 
     if let (Some(ip_addr), Ok(db)) = (ip, Store::open(&state.db_path)) {
         let _ = db.set_sni(&ip_addr.to_string(), sni.as_deref().unwrap_or_default());
+        let _ = db.set("preferred_direct_ip", &ip_addr.to_string());
     }
 
     (

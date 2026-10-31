@@ -229,22 +229,45 @@ impl Direct {
 fn direct_route(db: &store::Store, route: &Route, google_only: bool) -> Result<Direct> {
     let explicit = route.sni();
     let auto = explicit.is_none();
-    if let Some(ip) = route.ip {
-        return Ok(Direct {
-            ip,
-            sni: explicit,
-            auto,
-            backups: Vec::new(),
-        });
-    }
     let google = ranges::current(db);
-    let mut routes = scan::usable(db.routes(16)?, &google, google_only);
+    let mut routes = scan::usable(db.routes(16).unwrap_or_default(), &google, google_only);
     if routes.is_empty() {
         let _ = scan::run(db, None, google_only);
         routes = scan::usable(db.routes(16).unwrap_or_default(), &google, google_only);
     }
+
+    if let Some(ip) = route.ip {
+        let backups = routes
+            .into_iter()
+            .filter(|r| r.ip != ip)
+            .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
+            .take(8)
+            .collect();
+        return Ok(Direct {
+            ip,
+            sni: explicit,
+            auto,
+            backups,
+        });
+    }
+
+    let preferred_ip = db
+        .setting("preferred_direct_ip")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<IpAddr>().ok());
+
     let identity = |sni: String| (!sni.is_empty()).then_some(sni);
-    let mut routes = routes.into_iter().map(|r| (r.ip, identity(r.sni)));
+    let mut mapped_routes: Vec<_> = routes.into_iter().map(|r| (r.ip, identity(r.sni))).collect();
+
+    if let Some(pref) = preferred_ip {
+        if let Some(pos) = mapped_routes.iter().position(|(ip, _)| *ip == pref) {
+            let pref_item = mapped_routes.remove(pos);
+            mapped_routes.insert(0, pref_item);
+        }
+    }
+
+    let mut routes = mapped_routes.into_iter();
     let (ip, stored) = routes
         .next()
         .unwrap_or_else(|| ("142.250.190.46".parse().unwrap(), Some("g.cn".to_string())));
