@@ -16,25 +16,17 @@ import {
   Maximize,
   Minimize,
   Minimize2,
-  Music,
-  Palette,
   Pause,
   PictureInPicture,
   Play,
   RectangleHorizontal,
   RefreshCw,
   RotateCcw,
-  Search,
-  Server,
-  Settings,
-  Share2,
   SkipBack,
   SkipForward,
-  Sliders,
   Smartphone,
   Subtitles,
   Tv,
-  Upload,
   Volume2,
   VolumeX,
   X,
@@ -42,7 +34,7 @@ import {
 } from 'lucide-react';
 import { DriveFile, SystemStatus, StreamSession } from '../types';
 import { copyToClipboard } from '../utils/clipboard';
-import { searchDriveFiles, fetchVideoSubtitle, saveVideoSubtitle } from '../api';
+import { fetchVideoSubtitle, saveVideoSubtitle } from '../api';
 import {
   SubtitleCue,
   SubtitleStyleConfig,
@@ -51,15 +43,11 @@ import {
   saveSubtitleStyle,
   splitBilingualText,
 } from '../utils/subtitles';
-
-export type AspectRatioMode = 'contain' | 'cover' | 'fill' | '16:9' | '4:3' | '21:9';
-
-interface EmbeddedTrack {
-  index: number;
-  label: string;
-  language: string;
-  kind: string;
-}
+import { AspectRatioMode, EmbeddedTrack, OnlineSubItem } from './player/types';
+import { SubtitleMenu } from './player/SubtitleMenu';
+import { QueueMenu } from './player/QueueMenu';
+import { ExternalPlayerModal } from './player/ExternalPlayerModal';
+import { PlayerInfoDrawer } from './player/PlayerInfoDrawer';
 
 interface PlayerModalProps {
   file: DriveFile;
@@ -67,15 +55,6 @@ interface PlayerModalProps {
   folderFiles?: DriveFile[];
   onClose: () => void;
   onSelectFile?: (file: DriveFile) => void;
-}
-
-interface OnlineSubItem {
-  id: string;
-  name: string;
-  lang: string;
-  source: 'drive' | 'custom' | 'shooter';
-  content?: string;
-  url?: string;
 }
 
 export const PlayerModal: React.FC<PlayerModalProps> = ({
@@ -87,9 +66,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const userPausedRef = useRef<boolean>(false);
 
   // Core Playback State
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isUserPaused, setIsUserPaused] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -103,6 +84,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [controlsVisible, setControlsVisible] = useState(true);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Interaction feedback ripples & badges
+  const [centerIconState, setCenterIconState] = useState<'play' | 'pause' | 'forward' | 'backward' | null>(null);
+  const [isSpeedBoosted, setIsSpeedBoosted] = useState(false);
+  const speedBoostRestoreRateRef = useRef<number>(1);
+  const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastTapTimeRef = useRef<{ time: number; x: number }>({ time: 0, x: 0 });
+
   // Error & Resilient Recovery State
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isReconnecting, setIsReconnecting] = useState(false);
@@ -112,7 +100,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [showExternalModal, setShowExternalModal] = useState(false);
   const [useOfficial302, setUseOfficial302] = useState(false);
 
-  // Floating Mini-Player State (页面悬浮小窗)
+  // Floating Mini-Player State
   const [isFloating, setIsFloating] = useState(false);
 
   // Progress Memory (Resume)
@@ -128,16 +116,30 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [actionToast, setActionToast] = useState<string | null>(null);
 
-  // Video Metadata & Aspect Ratio
+  // Video Metadata & Aspect Ratio (Default strictly contain = 零裁切原画自适应)
   const [videoWidth, setVideoWidth] = useState(0);
   const [videoHeight, setVideoHeight] = useState(0);
-  const [aspectRatio, setAspectRatio] = useState<AspectRatioMode>(() => {
-    return (localStorage.getItem('gdirect_aspect_ratio') as AspectRatioMode) || 'contain';
-  });
+  const [aspectRatio, setAspectRatio] = useState<AspectRatioMode>('contain');
   const [showAspectMenu, setShowAspectMenu] = useState(false);
 
+  // Device & Platform Detection
+  const isIOS = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+  }, []);
+
+  const isMobile = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return (
+      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+      (typeof window !== 'undefined' && window.innerWidth < 768)
+    );
+  }, []);
+
   // Subtitle System (Dual Subtitles & Custom Styling)
-  const [subTab, setSubTab] = useState<'folder' | 'online' | 'style' | 'sources' | 'paste' | 'embedded'>('folder');
   const [primaryCues, setPrimaryCues] = useState<SubtitleCue[]>([]);
   const [secondaryCues, setSecondaryCues] = useState<SubtitleCue[]>([]);
   const [primaryName, setPrimaryName] = useState<string>('无');
@@ -150,6 +152,17 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [embeddedTracks, setEmbeddedTracks] = useState<EmbeddedTrack[]>([]);
   const [activeEmbeddedTrack, setActiveEmbeddedTrack] = useState<number | null>(null);
   const [embeddedSubtitleText, setEmbeddedSubtitleText] = useState<string | null>(null);
+
+  // Subtitle Appearance Customization
+  const [subStyle, setSubStyle] = useState<SubtitleStyleConfig>(loadSavedSubtitleStyle);
+
+  const updateSubStyle = (patch: Partial<SubtitleStyleConfig>) => {
+    setSubStyle((prev) => {
+      const next = { ...prev, ...patch };
+      saveSubtitleStyle(next);
+      return next;
+    });
+  };
 
   const persistSubtitleMemory = (
     pId: string | null = primarySubId,
@@ -171,17 +184,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     saveVideoSubtitle(file.id, pref);
   };
 
-  // Subtitle Appearance Customization
-  const [subStyle, setSubStyle] = useState<SubtitleStyleConfig>(loadSavedSubtitleStyle);
-
-  const updateSubStyle = (patch: Partial<SubtitleStyleConfig>) => {
-    setSubStyle((prev) => {
-      const next = { ...prev, ...patch };
-      saveSubtitleStyle(next);
-      return next;
-    });
-  };
-
   // Subtitle Sources Configuration
   const [customSourceUrl, setCustomSourceUrl] = useState(() => {
     return localStorage.getItem('gdirect_custom_sub_source') || '';
@@ -191,7 +193,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return saved ? JSON.parse(saved) : ['全盘 Google Drive 检索'];
   });
 
-  // Online Subtitle Search State
+  // Online Subtitle Keyword
   const cleanTitle = useMemo(() => {
     return file.name
       .replace(/\.(mp4|mkv|avi|mov|wmv|flv|webm|ts|m4v)$/i, '')
@@ -200,10 +202,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       .replace(/\s+/g, ' ')
       .trim();
   }, [file.name]);
-
-  const [searchKeyword, setSearchKeyword] = useState(cleanTitle);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchResults, setSearchResults] = useState<OnlineSubItem[]>([]);
 
   // Playlist / Queue Management
   const isVideoFile = (f: DriveFile) => {
@@ -230,32 +228,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return localStorage.getItem('gdirect_auto_next') !== 'false';
   });
 
-  // Current Video Index in Queue
   const currentQueueIndex = useMemo(() => {
     return playQueue.findIndex((item) => item.id === file.id);
   }, [playQueue, file.id]);
 
-  // Device & Platform Detection
-  const isIOS = useMemo(() => {
-    if (typeof navigator === 'undefined') return false;
-    return (
-      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-    );
-  }, []);
-
-  const isMobile = useMemo(() => {
-    if (typeof navigator === 'undefined') return false;
-    return (
-      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
-      (typeof window !== 'undefined' && window.innerWidth < 768)
-    );
-  }, []);
-
   // Real-time speed from backend
   const [streamSpeedMbps, setStreamSpeedMbps] = useState<string>('0.0');
 
-  // Active real-time stream bandwidth polling (runs even during initial buffer / stalls)
   useEffect(() => {
     let active = true;
     const pollSpeed = () => {
@@ -287,7 +266,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const streamUrl = useOfficial302 ? `${baseStreamUrl}${tokenParam ? '&' : '?'}mode=302` : baseStreamUrl;
   const official302Url = `${baseStreamUrl}${tokenParam ? '&' : '?'}mode=302`;
 
-  // Formatted Resolution Label
   const resolutionBadge = useMemo(() => {
     if (videoWidth >= 3800 || videoHeight >= 2000) return '4K UHD';
     if (videoWidth >= 1900 || videoHeight >= 1000) return '1080p FHD';
@@ -296,7 +274,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return 'HD';
   }, [videoWidth, videoHeight]);
 
-  // Average Bitrate
   const avgBitrateMbps = useMemo(() => {
     const bytes = parseInt(file.size || '0', 10);
     if (bytes > 0 && duration > 0) {
@@ -305,7 +282,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return null;
   }, [file.size, duration]);
 
-  // Format time
   const formatTime = (secs: number) => {
     if (isNaN(secs) || secs < 0) return '00:00';
     const h = Math.floor(secs / 3600);
@@ -322,56 +298,34 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     setTimeout(() => setActionToast(null), 1500);
   };
 
-  // Aspect Ratio & Cropping Controls
+  const triggerCenterFeedback = (type: 'play' | 'pause' | 'forward' | 'backward') => {
+    setCenterIconState(type);
+    setTimeout(() => setCenterIconState(null), 500);
+  };
+
+  // Aspect ratio label dictionary
+  const aspectLabels: Record<AspectRatioMode, string> = {
+    contain: '原画自适应 (零裁切)',
+    cover: '铺满屏幕 (裁剪去黑边)',
+    fill: '拉伸全屏',
+    '16:9': '16:9 标准宽屏',
+    '4:3': '4:3 经典方屏',
+    '21:9': '21:9 影院超宽屏',
+  };
+
   const cycleAspectRatio = () => {
     const modes: AspectRatioMode[] = ['contain', 'cover', 'fill', '16:9', '4:3', '21:9'];
     const nextIdx = (modes.indexOf(aspectRatio) + 1) % modes.length;
     const nextMode = modes[nextIdx];
     setAspectRatio(nextMode);
-    localStorage.setItem('gdirect_aspect_ratio', nextMode);
-    const labels: Record<AspectRatioMode, string> = {
-      contain: '最佳适配 (完整显示，零裁剪)',
-      cover: '智能铺满 (去黑边，居中裁剪)',
-      fill: '拉伸铺满 (撑满视口)',
-      '16:9': '16:9 标准宽屏',
-      '4:3': '4:3 经典方屏',
-      '21:9': '21:9 影院超宽银幕',
-    };
-    showToast(`画面比例：${labels[nextMode]}`);
+    showToast(`画面比例: ${aspectLabels[nextMode]}`);
   };
 
   const selectAspectRatio = (mode: AspectRatioMode) => {
     setAspectRatio(mode);
-    localStorage.setItem('gdirect_aspect_ratio', mode);
     setShowAspectMenu(false);
-    const labels: Record<AspectRatioMode, string> = {
-      contain: '最佳适配 (完整显示，零裁剪)',
-      cover: '智能铺满 (去黑边，居中裁剪)',
-      fill: '拉伸铺满 (撑满视口)',
-      '16:9': '16:9 标准宽屏',
-      '4:3': '4:3 经典方屏',
-      '21:9': '21:9 影院超宽银幕',
-    };
-    showToast(`画面比例：${labels[mode]}`);
+    showToast(`画面比例: ${aspectLabels[mode]}`);
   };
-
-  const videoFitClass = useMemo(() => {
-    switch (aspectRatio) {
-      case 'cover':
-        return 'w-full h-full object-cover';
-      case 'fill':
-        return 'w-full h-full object-fill';
-      case '16:9':
-        return 'max-w-full max-h-full aspect-video object-contain';
-      case '4:3':
-        return 'max-w-full max-h-full aspect-[4/3] object-contain';
-      case '21:9':
-        return 'max-w-full max-h-full aspect-[21/9] object-contain';
-      case 'contain':
-      default:
-        return 'w-full h-full object-contain';
-    }
-  }, [aspectRatio]);
 
   // Embedded Subtitle Detection & Track Selection
   const detectEmbeddedTracks = () => {
@@ -416,20 +370,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }
   };
 
-  // Listen to addtrack event on video textTracks
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    const handleAddTrack = () => {
-      detectEmbeddedTracks();
-    };
+    const handleAddTrack = () => detectEmbeddedTracks();
     video.textTracks.addEventListener('addtrack', handleAddTrack);
     return () => {
       video.textTracks.removeEventListener('addtrack', handleAddTrack);
     };
   }, []);
 
-  // Sync active cues from embedded track to primary subtitle renderer
   useEffect(() => {
     if (!videoRef.current || activeEmbeddedTrack === null) return;
     const track = videoRef.current.textTracks[activeEmbeddedTrack];
@@ -454,7 +404,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     };
   }, [activeEmbeddedTrack]);
 
-  // Auto-discover matching subtitles in current folder
   const sameFolderSubtitles = useMemo(() => {
     return folderFiles.filter((f) => {
       const lower = f.name.toLowerCase();
@@ -462,7 +411,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     });
   }, [folderFiles]);
 
-  // Load Subtitle by ID helper
   const loadSubById = async (subId: string, subName: string, target: 'primary' | 'secondary') => {
     try {
       const url = `${window.location.origin}/d/${subId}/${encodeURIComponent(subName)}${tokenParam}`;
@@ -488,30 +436,23 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return false;
   };
 
-  // Subtitle Memory Loader: First check localStorage, then check server Jinli SQLite, else fallback to sameFolderSubtitles
   useEffect(() => {
     let restored = false;
-
-    // 1. Try browser localStorage
     const localSaved = localStorage.getItem(`gdirect_sub_${file.id}`);
     if (localSaved) {
       try {
         const pref = JSON.parse(localSaved);
         if (pref.primary_sub_id && pref.primary_sub_name) {
           loadSubById(pref.primary_sub_id, pref.primary_sub_name, 'primary');
-          if (pref.secondary_sub_id && pref.secondary_sub_name) {
-            loadSubById(pref.secondary_sub_id, pref.secondary_sub_name, 'secondary');
-          }
-          if (typeof pref.sub_offset === 'number') {
-            setSubOffsetSecs(pref.sub_offset);
-          }
-          showToast(`已恢复字幕记忆: ${pref.primary_sub_name}`);
           restored = true;
         }
+        if (pref.secondary_sub_id && pref.secondary_sub_name) {
+          loadSubById(pref.secondary_sub_id, pref.secondary_sub_name, 'secondary');
+        }
+        if (pref.sub_offset) setSubOffsetSecs(pref.sub_offset);
       } catch {}
     }
 
-    // 2. If not in localStorage, query Jinli SQLite
     if (!restored) {
       fetchVideoSubtitle(file.id).then((serverPref) => {
         if (serverPref && serverPref.primary_sub_id && serverPref.primary_sub_name) {
@@ -519,121 +460,20 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           if (serverPref.secondary_sub_id && serverPref.secondary_sub_name) {
             loadSubById(serverPref.secondary_sub_id, serverPref.secondary_sub_name, 'secondary');
           }
-          if (typeof serverPref.sub_offset === 'number') {
-            setSubOffsetSecs(serverPref.sub_offset);
-          }
-          showToast(`已从网关同步字幕: ${serverPref.primary_sub_name}`);
-          restored = true;
+          if (serverPref.sub_offset) setSubOffsetSecs(serverPref.sub_offset);
         } else if (sameFolderSubtitles.length > 0) {
-          // 3. Fallback: match same folder subtitles
           const videoStem = file.name.substring(0, file.name.lastIndexOf('.')).toLowerCase();
-          const matched = sameFolderSubtitles.filter((sub) => {
-            const subName = sub.name.toLowerCase();
+          const match = sameFolderSubtitles.find((s) => {
+            const subName = s.name.toLowerCase();
             return subName.includes(videoStem) || subName.startsWith(videoStem.substring(0, Math.min(8, videoStem.length)));
           });
-          if (matched.length > 0) {
-            const zhSub = matched.find((s) => s.name.toLowerCase().match(/(zh|chs|cht|chi|cn|sc|tc|中)/)) || matched[0];
-            const enSub = matched.find((s) => s.id !== zhSub.id && s.name.toLowerCase().match(/(en|eng|english|英)/));
-            loadSubById(zhSub.id, zhSub.name, 'primary');
-            if (enSub) {
-              loadSubById(enSub.id, enSub.name, 'secondary');
-            }
-          }
+          const chosen = match || sameFolderSubtitles[0];
+          loadSubById(chosen.id, chosen.name, 'primary');
         }
       });
     }
-  }, [file.id, file.name, sameFolderSubtitles, tokenParam]);
+  }, [file.id, sameFolderSubtitles]);
 
-  // Load a subtitle from Drive file
-  const loadDriveSubtitle = async (sub: DriveFile, target: 'primary' | 'secondary') => {
-    try {
-      const url = `${window.location.origin}/d/${sub.id}/${encodeURIComponent(sub.name)}${tokenParam}`;
-      const res = await fetch(url);
-      const text = await res.text();
-      const parsed = parseSubtitle(text);
-      if (parsed.length === 0) {
-        showToast('⚠️ 未能解析出有效字幕');
-      } else {
-        showToast(`已装载: ${sub.name} (${parsed.length}条)`);
-      }
-      if (target === 'primary') {
-        setPrimaryCues(parsed);
-        setPrimaryName(sub.name);
-        setPrimarySubId(sub.id);
-        persistSubtitleMemory(sub.id, sub.name, secondarySubId, secondaryName, subOffsetSecs);
-      } else {
-        setSecondaryCues(parsed);
-        setSecondaryName(sub.name);
-        setSecondarySubId(sub.id);
-        persistSubtitleMemory(primarySubId, primaryName, sub.id, sub.name, subOffsetSecs);
-      }
-      if (videoRef.current) {
-        setCurrentTime(videoRef.current.currentTime);
-      }
-    } catch (e: any) {
-      alert(`字幕读取失败: ${e.message}`);
-    }
-  };
-
-  // Comprehensive Subtitle Search (Drive Full Search + Custom API)
-  const handleOnlineSearch = async () => {
-    if (!searchKeyword.trim()) return;
-    setSearchLoading(true);
-    setSearchResults([]);
-
-    const aggregated: OnlineSubItem[] = [];
-
-    // 1. Google Drive Recursive Search API
-    try {
-      const driveItems = await searchDriveFiles(searchKeyword.trim());
-      const subItems = driveItems.filter((item) => {
-        const lower = item.name.toLowerCase();
-        return lower.endsWith('.srt') || lower.endsWith('.vtt') || lower.endsWith('.ass') || lower.endsWith('.ssa');
-      });
-
-      for (const item of subItems) {
-        aggregated.push({
-          id: item.id,
-          name: item.name,
-          lang: item.name.match(/(zh|cn|chs|cht|中)/i) ? '简体/繁体中文' : '英文字幕',
-          source: 'drive',
-          url: `${window.location.origin}/d/${item.id}/${encodeURIComponent(item.name)}${tokenParam}`,
-        });
-      }
-    } catch (err) {
-      console.warn('Drive subtitle search error:', err);
-    }
-
-    // 2. Custom Subtitle API Endpoint (if configured)
-    if (customSourceUrl.trim()) {
-      try {
-        const targetUrl = `${customSourceUrl.replace('{query}', encodeURIComponent(searchKeyword))}`;
-        const res = await fetch(targetUrl);
-        if (res.ok) {
-          const list = await res.json();
-          if (Array.isArray(list)) {
-            list.forEach((item: any, idx: number) => {
-              aggregated.push({
-                id: `custom_${idx}_${Date.now()}`,
-                name: item.name || item.title || `自定义字幕源 #${idx + 1}`,
-                lang: item.lang || '在线多语',
-                source: 'custom',
-                url: item.url || item.download_url,
-                content: item.content,
-              });
-            });
-          }
-        }
-      } catch (e) {
-        console.warn('Custom subtitle source fetch failed:', e);
-      }
-    }
-
-    setSearchResults(aggregated);
-    setSearchLoading(false);
-  };
-
-  // Add Custom Subtitle Source
   const handleAddCustomSource = (url: string) => {
     if (!url.trim()) return;
     setCustomSourceUrl(url.trim());
@@ -644,14 +484,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     showToast('自定义字幕源已保存');
   };
 
-  // Queue Operations: Next, Previous, Auto Play
   const playNextInQueue = () => {
     if (playQueue.length === 0) return;
     const nextIdx = (currentQueueIndex + 1) % playQueue.length;
     const nextFile = playQueue[nextIdx];
     if (nextFile && onSelectFile) {
       onSelectFile(nextFile);
-      showToast(`切换至: ${nextFile.name}`);
+      showToast(`下一集: ${nextFile.name}`);
     }
   };
 
@@ -661,11 +500,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     const prevFile = playQueue[prevIdx];
     if (prevFile && onSelectFile) {
       onSelectFile(prevFile);
-      showToast(`切换至: ${prevFile.name}`);
+      showToast(`上一集: ${prevFile.name}`);
     }
   };
 
-  // Playback & Buffer Tracking + Progress Memory
+  // Buffer Tracking
   const updateBufferInfo = useCallback(() => {
     if (!videoRef.current) return;
     const v = videoRef.current;
@@ -695,7 +534,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     const curr = videoRef.current.currentTime;
     setCurrentTime(curr);
 
-    // Save playback progress to localStorage every 2 seconds
     const nowSec = Math.floor(curr);
     if (Math.abs(nowSec - lastSavedTimeRef.current) >= 2) {
       lastSavedTimeRef.current = nowSec;
@@ -707,7 +545,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     updateBufferInfo();
   };
 
-  // Video Ended -> Intelligent Queue Next
   const handleVideoEnded = () => {
     if (autoNext && onSelectFile && playQueue.length > 1) {
       showToast('本集播放完毕，自动播放下一集');
@@ -715,7 +552,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }
   };
 
-  // Dual Subtitles Matching & Auto Bilingual Splitting
+  // Subtitle cue matching
   const adjustedTime = currentTime + subOffsetSecs;
 
   const activeCues = useMemo(() => {
@@ -726,21 +563,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       ? secondaryCues.find((c) => c.start <= adjustedTime && adjustedTime <= c.end)?.text || null
       : null;
 
-    // If single subtitle loaded and bilingual splitting is enabled
     if (rawPrim && !rawSec && subStyle.bilingualSplit) {
       const split = splitBilingualText(rawPrim);
       if (split.secondary) {
-        return {
-          primary: split.primary,
-          secondary: split.secondary,
-        };
+        return { primary: split.primary, secondary: split.secondary };
       }
     }
 
     return { primary: rawPrim, secondary: rawSec };
   }, [primaryCues, secondaryCues, adjustedTime, subStyle.bilingualSplit, embeddedSubtitleText]);
 
-  // Subtitle Item Style Calculator
   const getSubtitleItemStyle = (type: 'primary' | 'secondary'): React.CSSProperties => {
     const isPrimary = type === 'primary';
     const color = isPrimary ? subStyle.primaryColor : subStyle.secondaryColor;
@@ -779,8 +611,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return base;
   };
 
-  // Controls logic
+  // Safe Play: Strictly checks userPausedRef to prevent unwanted auto-resume after pause!
   const safePlay = useCallback(() => {
+    if (userPausedRef.current) return;
     const video = videoRef.current;
     if (!video || !video.paused) return;
     const playPromise = video.play();
@@ -788,10 +621,10 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       playPromise
         .then(() => {
           setIsPlaying(true);
+          setIsUserPaused(false);
           setIsBuffering(false);
         })
         .catch((err) => {
-          // If browser blocked unmuted autoplay on fresh page reload
           if (err.name === 'NotAllowedError') {
             video.muted = true;
             setIsMuted(true);
@@ -799,8 +632,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
               .play()
               .then(() => {
                 setIsPlaying(true);
+                setIsUserPaused(false);
                 setIsBuffering(false);
-                showToast('已静音起播 (点击音量可开启声音)');
+                showToast('已静音播放 (点击音量可开启声音)');
               })
               .catch(() => {});
           }
@@ -811,12 +645,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const togglePlay = () => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
+      userPausedRef.current = false;
+      setIsUserPaused(false);
       safePlay();
-      showToast('播放');
+      triggerCenterFeedback('play');
     } else {
+      userPausedRef.current = true;
+      setIsUserPaused(true);
       videoRef.current.pause();
       setIsPlaying(false);
-      showToast('暂停');
+      triggerCenterFeedback('pause');
     }
   };
 
@@ -847,7 +685,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     videoRef.current.playbackRate = rate;
     setPlaybackRate(rate);
     setShowSpeedMenu(false);
-    showToast(`${rate}x`);
+    showToast(`${rate}x 速度`);
   };
 
   const toggleFullscreen = () => {
@@ -880,7 +718,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     if (!videoRef.current) return;
     const v = videoRef.current as any;
     try {
-      // 1. WebKit Presentation Mode (iOS Safari standard Picture-in-Picture)
       if (typeof v.webkitSetPresentationMode === 'function') {
         const currentMode = v.webkitPresentationMode;
         const targetMode = currentMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture';
@@ -888,7 +725,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
         showToast(targetMode === 'picture-in-picture' ? '进入画中画' : '退出画中画');
         return;
       }
-      // 2. Standard W3C Picture-in-Picture API
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
         showToast('退出画中画');
@@ -902,7 +738,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
         showToast(isFloating ? '全屏展开' : '页面悬浮小窗');
       }
     } catch (err) {
-      console.warn('PiP failed, falling back:', err);
       if (typeof v.webkitEnterFullscreen === 'function') {
         v.webkitEnterFullscreen();
       } else {
@@ -911,7 +746,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }
   };
 
-  // Resilient Stream Reload & Error Recovery
+  // Stream reload & error recovery
   const performStreamReload = (switchRoute = false) => {
     if (retryTimerRef.current) clearInterval(retryTimerRef.current);
     setRetryCountdown(null);
@@ -932,7 +767,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       if (videoRef.current) {
         videoRef.current.load();
         videoRef.current.currentTime = cur;
-        safePlay();
+        if (!userPausedRef.current) {
+          safePlay();
+        }
       }
     }, 250);
   };
@@ -940,9 +777,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const handleVideoError = () => {
     const err = videoRef.current?.error;
     const code = err?.code;
-    console.warn('Video error detected:', code, err);
+    console.warn('Video playback error:', code, err);
 
-    // Auto-retry up to 2 times before blocking with recovery card
     if (retryCount < 2) {
       setRetryCount((prev) => prev + 1);
       setRetryCountdown(2);
@@ -963,9 +799,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       return;
     }
 
-    let message = '网络流连接超时或缓冲中断，请立即重试或切换传输线路';
+    let message = '网络流连接超时或缓冲中断，可立即重试或切换传输线路';
     if (code === 4) {
-      message = '当前浏览器可能无法直接解码此格式，可切换官方 302 或外部播放器';
+      message = '当前浏览器可能无法直接解码此视频封装格式，建议使用官方直链或外部播放器';
     } else if (code === 3) {
       message = '视频解码遇到错误，建议重试或切换为官方直链';
     } else if (code === 2) {
@@ -976,7 +812,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     setRetryCountdown(null);
   };
 
-  // Keyboard controls
+  // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -990,6 +826,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           e.preventDefault();
           if (videoRef.current) {
             videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 5);
+            triggerCenterFeedback('backward');
             showToast('-5s');
           }
           break;
@@ -997,6 +834,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           e.preventDefault();
           if (videoRef.current) {
             videoRef.current.currentTime = Math.min(duration, videoRef.current.currentTime + 5);
+            triggerCenterFeedback('forward');
             showToast('+5s');
           }
           break;
@@ -1042,19 +880,70 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [duration, isPlaying, isMuted, immersiveMode, playQueue, currentQueueIndex]);
+  }, [duration, isPlaying, isMuted, immersiveMode, playQueue, currentQueueIndex, aspectRatio]);
 
-  // Motion auto-hide: Hide all controls after 2.5s idle
   const handleMouseMove = () => {
     setControlsVisible(true);
     if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
     controlsTimeoutRef.current = setTimeout(() => {
       if (isPlaying && !immersiveMode) setControlsVisible(false);
-    }, 2500);
+    }, 2800);
+  };
+
+  // Touch and click handlers for mobile & gestures
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    const now = Date.now();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = touch.clientX - rect.left;
+    const width = rect.width;
+
+    // Check double-tap gesture
+    if (now - lastTapTimeRef.current.time < 320 && Math.abs(x - lastTapTimeRef.current.x) < 80) {
+      if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+      if (x < width * 0.35) {
+        if (videoRef.current) {
+          videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
+          triggerCenterFeedback('backward');
+          showToast('-10s 快退');
+        }
+      } else if (x > width * 0.65) {
+        if (videoRef.current) {
+          videoRef.current.currentTime = Math.min(duration, videoRef.current.currentTime + 10);
+          triggerCenterFeedback('forward');
+          showToast('+10s 快进');
+        }
+      } else {
+        togglePlay();
+      }
+      lastTapTimeRef.current = { time: 0, x: 0 };
+      return;
+    }
+
+    lastTapTimeRef.current = { time: now, x };
+
+    // Long press for 2x speed
+    if (isPlaying && videoRef.current) {
+      if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = setTimeout(() => {
+        if (videoRef.current && isPlaying) {
+          speedBoostRestoreRateRef.current = videoRef.current.playbackRate;
+          videoRef.current.playbackRate = 2.0;
+          setIsSpeedBoosted(true);
+        }
+      }, 550);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    if (isSpeedBoosted && videoRef.current) {
+      videoRef.current.playbackRate = speedBoostRestoreRateRef.current;
+      setIsSpeedBoosted(false);
+    }
   };
 
   const handleScreenClick = (e: React.MouseEvent) => {
-    // If immersive mode is active, clicking canvas wakes the exit prompt and controls temporarily
     if (immersiveMode) {
       setControlsVisible(true);
       if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
@@ -1073,6 +962,34 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     setTimeout(() => setCopyFeedback(false), 2000);
   };
 
+  // Accurate CSS geometry based on selected aspect ratio
+  const videoStyle: React.CSSProperties = useMemo(() => {
+    const isCover = aspectRatio === 'cover';
+    const isFill = aspectRatio === 'fill';
+
+    const base: React.CSSProperties = {
+      objectFit: isCover ? 'cover' : isFill ? 'fill' : 'contain',
+      maxWidth: '100%',
+      maxHeight: '100%',
+      width: isCover || isFill ? '100%' : 'auto',
+      height: isCover || isFill ? '100%' : 'auto',
+      margin: 'auto',
+      display: 'block',
+    };
+
+    if (aspectRatio === '16:9') {
+      base.aspectRatio = '16 / 9';
+    } else if (aspectRatio === '4:3') {
+      base.aspectRatio = '4 / 3';
+    } else if (aspectRatio === '21:9') {
+      base.aspectRatio = '21 / 9';
+    } else if (aspectRatio === 'contain' && videoWidth > 0 && videoHeight > 0) {
+      base.aspectRatio = `${videoWidth} / ${videoHeight}`;
+    }
+
+    return base;
+  }, [aspectRatio, videoWidth, videoHeight]);
+
   return (
     <div
       className={
@@ -1084,11 +1001,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       <div
         ref={containerRef}
         onMouseMove={handleMouseMove}
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
         className={`relative w-full h-full flex flex-col justify-between bg-black overflow-hidden select-none ${
           !controlsVisible && isPlaying && !isFloating && !immersiveMode ? 'cursor-none' : 'cursor-default'
         } ${isFloating ? 'aspect-video' : ''}`}
       >
-        {/* Floating Immersive Exit Button (ALWAYS ACCESSIBLE IN IMMERSIVE MODE) */}
+        {/* Floating Immersive Exit Button */}
         {immersiveMode && (
           <div className="absolute top-4 inset-x-0 flex justify-center z-50 pointer-events-auto animate-fade-in">
             <button
@@ -1096,13 +1015,21 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 e.stopPropagation();
                 setImmersiveMode(false);
                 setControlsVisible(true);
-                showToast('已退出沉浸观影');
+                showToast('已退出沉浸模式');
               }}
               className="px-4 py-2 rounded-full bg-slate-900/95 hover:bg-slate-800 text-cyan-300 border border-cyan-500/50 shadow-2xl backdrop-blur-md text-xs font-semibold flex items-center space-x-2 transition-all active:scale-95"
             >
               <EyeOff className="w-4 h-4" />
-              <span>退出沉浸观影 (点此或按Z)</span>
+              <span>退出沉浸观影</span>
             </button>
+          </div>
+        )}
+
+        {/* Long Press 2x Speed Pill Banner */}
+        {isSpeedBoosted && (
+          <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-1.5 rounded-full bg-cyan-500/90 text-slate-950 font-bold text-xs shadow-2xl flex items-center space-x-1.5 animate-pulse">
+            <FastForward className="w-3.5 h-3.5" />
+            <span>2.0x 极速快进中</span>
           </div>
         )}
 
@@ -1137,19 +1064,18 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 const nextMode = !useOfficial302;
                 setUseOfficial302(nextMode);
                 setVideoError(null);
-                showToast(nextMode ? '已切换: 官方 302 直链 (需翻墙)' : '已切换: 国内边缘直连 (免翻墙)');
+                showToast(nextMode ? '已切换: 官方 302' : '已切换: 边缘直连');
               }}
               className={`hidden sm:flex px-2 py-0.5 rounded-lg text-[10px] sm:text-xs font-mono font-semibold border transition-colors items-center space-x-1 ${
                 useOfficial302
                   ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
                   : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-300'
               }`}
-              title="点击切换传输模式"
             >
               <span>{useOfficial302 ? '官方 302' : '边缘直连'}</span>
             </button>
 
-            {/* Rate & Buffer Pill */}
+            {/* Live Rate & Buffer Pill */}
             <div className="flex px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-[10px] sm:text-xs font-mono text-slate-300 items-center space-x-1 sm:space-x-1.5">
               <Zap className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-cyan-400" />
               <span>{streamSpeedMbps} Mbps</span>
@@ -1162,24 +1088,22 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             <button
               onClick={() => setShowExternalModal(true)}
               className="px-2.5 py-1 rounded-lg text-xs font-medium bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 hover:text-white transition-colors flex items-center space-x-1"
-              title="调用外部播放器 (VLC/Infuse/IINA/MX)"
             >
               <ExternalLink className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">外部播放</span>
             </button>
 
-            {/* Floating Mini-Player Switch (悬浮小窗) */}
+            {/* Floating Mini-Player Switch */}
             <button
               onClick={() => {
                 setIsFloating(!isFloating);
-                showToast(isFloating ? '全屏展开' : '页面悬浮播放');
+                showToast(isFloating ? '全屏展开' : '页面悬浮');
               }}
               className={`p-1.5 rounded-lg text-xs font-mono border transition-colors flex items-center space-x-1 ${
                 isFloating
                   ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
                   : 'bg-slate-900/80 border-slate-700 text-slate-400 hover:text-slate-200'
               }`}
-              title={isFloating ? '还原全尺寸' : '页面悬浮小窗'}
             >
               {isFloating ? <Maximize className="w-3.5 h-3.5" /> : <Minimize2 className="w-3.5 h-3.5" />}
             </button>
@@ -1192,7 +1116,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                   ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
                   : 'bg-slate-900/80 border-slate-700 text-slate-400 hover:text-slate-200'
               }`}
-              title="详细信息 (I)"
             >
               <Info className="w-3.5 h-3.5" />
             </button>
@@ -1207,52 +1130,21 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           </div>
         </div>
 
-        {/* Media Details Card (Info Drawer) */}
+        {/* Media Details Info Drawer */}
         {showInfo && !isFloating && (
-          <div className="absolute top-16 right-3 sm:right-6 z-40 p-4 rounded-2xl bg-slate-950/90 backdrop-blur-xl border border-slate-800 text-xs font-mono space-y-2 shadow-2xl min-w-[240px] animate-fade-in">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-              <span className="font-bold text-white font-sans">媒体流与硬件诊断</span>
-              <button onClick={() => setShowInfo(false)} className="text-slate-500 hover:text-slate-300">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="space-y-1.5 text-slate-300">
-              <div className="flex justify-between">
-                <span className="text-slate-500">传输路线:</span>
-                <span className={useOfficial302 ? "text-amber-300 font-bold" : "text-cyan-300 font-bold"}>
-                  {useOfficial302 ? "官方 302 重定向" : "国内边缘直连"}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">分辨率:</span>
-                <span className="text-cyan-300 font-bold">{videoWidth} x {videoHeight} ({resolutionBadge})</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">平均码率:</span>
-                <span className="text-slate-200">{avgBitrateMbps ? `${avgBitrateMbps} Mbps` : '自适应'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">实时带宽:</span>
-                <span className="text-emerald-400 font-bold">{streamSpeedMbps} Mbps</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">超前缓存:</span>
-                <span className="text-emerald-400">{bufferedAheadSecs} 秒</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Google 节点:</span>
-                <span className="text-slate-200 truncate max-w-[120px]">{status?.direct_ip || '直连'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">RAM 缓冲:</span>
-                <span className="text-purple-300">{status?.prefetch_mb || 16} MB (零落盘)</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">播放时长:</span>
-                <span className="text-slate-200">{formatTime(currentTime)} / {formatTime(duration)}</span>
-              </div>
-            </div>
-          </div>
+          <PlayerInfoDrawer
+            useOfficial302={useOfficial302}
+            videoWidth={videoWidth}
+            videoHeight={videoHeight}
+            resolutionBadge={resolutionBadge}
+            avgBitrateMbps={avgBitrateMbps}
+            streamSpeedMbps={streamSpeedMbps}
+            bufferedAheadSecs={bufferedAheadSecs}
+            status={status}
+            currentTimeFormatted={formatTime(currentTime)}
+            durationFormatted={formatTime(duration)}
+            onClose={() => setShowInfo(false)}
+          />
         )}
 
         {/* Action Center Toast */}
@@ -1260,6 +1152,18 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-40 animate-fade-in">
             <div className="px-5 py-2.5 rounded-2xl bg-black/85 backdrop-blur-md border border-slate-700 text-white font-bold text-base shadow-2xl">
               {actionToast}
+            </div>
+          </div>
+        )}
+
+        {/* Center Play/Pause & Gesture Animation Ripple */}
+        {centerIconState && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 animate-fade-in">
+            <div className="p-4 sm:p-5 rounded-full bg-black/70 backdrop-blur-md border border-slate-700/80 text-cyan-400 shadow-2xl animate-scale-up">
+              {centerIconState === 'play' && <Play className="w-8 h-8 sm:w-10 sm:h-10 fill-current ml-1" />}
+              {centerIconState === 'pause' && <Pause className="w-8 h-8 sm:w-10 sm:h-10 fill-current" />}
+              {centerIconState === 'forward' && <FastForward className="w-8 h-8 sm:w-10 sm:h-10 fill-current" />}
+              {centerIconState === 'backward' && <RotateCcw className="w-8 h-8 sm:w-10 sm:h-10" />}
             </div>
           </div>
         )}
@@ -1287,11 +1191,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           </div>
         )}
 
-        {/* Video Canvas & Subtitles Area */}
+        {/* Video Canvas & Subtitles Area (Strictly uncropped layout) */}
         <div
           onClick={handleScreenClick}
           onDoubleClick={toggleFullscreen}
-          className="relative flex-1 flex items-center justify-center cursor-pointer"
+          className="relative flex-1 w-full h-full min-h-0 min-w-0 overflow-hidden flex items-center justify-center cursor-pointer bg-black"
         >
           <video
             ref={videoRef}
@@ -1327,6 +1231,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             }}
             onPlaying={() => {
               setIsPlaying(true);
+              setIsUserPaused(false);
               setIsBuffering(false);
               setHasPlayedFirstFrame(true);
               setVideoError(null);
@@ -1337,7 +1242,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
               handleTimeUpdate();
               updateBufferInfo();
               setIsBuffering(false);
-              if (videoRef.current && videoRef.current.paused && !videoRef.current.ended) {
+              // CRITICAL: Never auto-resume playback if the user paused!
+              if (
+                videoRef.current &&
+                videoRef.current.paused &&
+                !userPausedRef.current &&
+                !videoRef.current.ended
+              ) {
                 safePlay();
               }
             }}
@@ -1355,7 +1266,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 setVideoHeight(videoRef.current.videoHeight);
                 updateBufferInfo();
 
-                // Check stored playback progress
                 const savedStr = localStorage.getItem(`gdirect_prog_${file.id}`);
                 if (savedStr) {
                   const sec = parseFloat(savedStr);
@@ -1370,12 +1280,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                   setCurrentTime(videoRef.current.currentTime);
                 }
 
-                // Auto-play immediately after metadata is ready
-                safePlay();
+                if (!userPausedRef.current) {
+                  safePlay();
+                }
               }
             }}
-            onPause={() => setIsPlaying(false)}
-            className={`${videoFitClass} transition-all duration-200`}
+            onPause={() => {
+              setIsPlaying(false);
+            }}
+            style={videoStyle}
+            className="transition-all duration-150"
           />
 
           {/* Centered Buffering & Speed HUD */}
@@ -1390,8 +1304,10 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                   <div className="text-xs sm:text-sm font-semibold text-white tracking-wide">
                     {isReconnecting
                       ? `网络重连中 ${retryCountdown !== null ? `(${retryCountdown}s)` : '...'}`
+                      : isUserPaused
+                      ? '已暂停 · 后台预读中'
                       : !hasPlayedFirstFrame
-                      ? '连接边缘节点并建立流...'
+                      ? '连接边缘节点并解析流...'
                       : '缓冲中...'}
                   </div>
                   <div className="flex items-center justify-center space-x-2 text-[10px] sm:text-xs font-mono text-slate-300">
@@ -1450,7 +1366,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                       className="w-full py-2 px-3 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-cyan-300 text-xs font-semibold border border-cyan-500/30 transition-colors flex items-center justify-center space-x-1.5"
                     >
                       <Smartphone className="w-4 h-4" />
-                      <span>调用 iOS 系统原生播放器 (支持原生 PiP)</span>
+                      <span>调用 iOS 原生系统播放器 (支持原生 PiP)</span>
                     </button>
                   )}
 
@@ -1466,7 +1382,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             </div>
           )}
 
-          {/* Subtitles Overlay (Supports Dual Subtitles & Dynamic Styles) */}
+          {/* Subtitles Overlay */}
           <div
             style={{ bottom: `${isFloating ? 16 : subStyle.bottomOffset}px` }}
             className="absolute inset-x-0 flex flex-col items-center pointer-events-none z-20 space-y-1 sm:space-y-1.5 px-3 sm:px-4 text-center transition-all duration-150"
@@ -1492,11 +1408,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
         {/* Bottom Control Bar */}
         <div
-          className={`absolute bottom-0 inset-x-0 z-30 p-2.5 sm:p-5 bg-gradient-to-t from-black/90 via-black/60 to-transparent transition-opacity duration-300 space-y-2 ${
+          className={`absolute bottom-0 inset-x-0 z-30 p-2.5 sm:p-5 pb-[calc(0.75rem+env(safe-area-inset-bottom))] bg-gradient-to-t from-black/90 via-black/60 to-transparent transition-opacity duration-300 space-y-2 ${
             controlsVisible && !immersiveMode ? 'opacity-100' : 'opacity-0 pointer-events-none'
           }`}
         >
-          {/* Progress / Seek Bar */}
+          {/* Progress Seek Bar */}
           <div className="relative group/progress flex items-center">
             <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden relative">
               <div
@@ -1520,7 +1436,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             />
           </div>
 
-          {/* Controls Bar */}
+          {/* Controls Buttons */}
           <div className="flex items-center justify-between text-white">
             <div className="flex items-center space-x-1 sm:space-x-3">
               {/* Previous in Queue */}
@@ -1537,7 +1453,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 onClick={togglePlay}
                 className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition-colors"
               >
-                {isPlaying ? <Pause className="w-4 h-4 sm:w-5 sm:h-5 fill-current" /> : <Play className="w-4 h-4 sm:w-5 sm:h-5 fill-current ml-0.5" />}
+                {isPlaying ? (
+                  <Pause className="w-4 h-4 sm:w-5 sm:h-5 fill-current" />
+                ) : (
+                  <Play className="w-4 h-4 sm:w-5 sm:h-5 fill-current ml-0.5" />
+                )}
               </button>
 
               {/* Next in Queue */}
@@ -1549,13 +1469,17 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 <SkipForward className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
               </button>
 
-              {/* Volume Slider (Hidden on small mobile) */}
+              {/* Volume Slider */}
               <div className="hidden sm:flex items-center space-x-2 group">
                 <button
                   onClick={toggleMute}
                   className="p-1.5 rounded-lg text-slate-300 hover:text-white transition-colors"
                 >
-                  {isMuted || volume === 0 ? <VolumeX className="w-4 h-4 sm:w-5 sm:h-5" /> : <Volume2 className="w-4 h-4 sm:w-5 sm:h-5" />}
+                  {isMuted || volume === 0 ? (
+                    <VolumeX className="w-4 h-4 sm:w-5 sm:h-5" />
+                  ) : (
+                    <Volume2 className="w-4 h-4 sm:w-5 sm:h-5" />
+                  )}
                 </button>
                 <input
                   type="range"
@@ -1576,7 +1500,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
               </div>
             </div>
 
-            {/* Right Action Icons: Queue, Subtitles, Speed, Immersive, PiP, Fullscreen */}
+            {/* Right Action Icons */}
             <div className="flex items-center space-x-1 sm:space-x-2">
               {/* Queue List Popover */}
               <div className="relative">
@@ -1587,608 +1511,114 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                       ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
                       : 'bg-white/10 border-transparent text-slate-300 hover:text-white'
                   }`}
-                  title="播放队列与连播设置"
+                  title="播放队列"
                 >
                   <ListOrdered className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
 
                 {showQueueMenu && (
-                  <div className="fixed sm:absolute bottom-16 sm:bottom-full left-3 right-3 sm:left-auto sm:right-0 mb-3 w-auto sm:w-[380px] rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-4 z-50 text-xs space-y-3">
-                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                      <div className="flex items-center space-x-2">
-                        <span className="font-bold text-white">播放队列 ({playQueue.length})</span>
-                        <label className="flex items-center space-x-1.5 cursor-pointer text-slate-400 text-[11px]">
-                          <input
-                            type="checkbox"
-                            checked={autoNext}
-                            onChange={(e) => {
-                              setAutoNext(e.target.checked);
-                              localStorage.setItem('gdirect_auto_next', String(e.target.checked));
-                              showToast(e.target.checked ? '已开启自动连播' : '已关闭自动连播');
-                            }}
-                            className="accent-cyan-400 rounded"
-                          />
-                          <span>自动连播</span>
-                        </label>
-                      </div>
-                      <button onClick={() => setShowQueueMenu(false)} className="text-slate-500 hover:text-slate-300">
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    <div className="space-y-1 max-h-56 overflow-y-auto">
-                      {playQueue.map((item, idx) => {
-                        const isCurrent = item.id === file.id;
-                        return (
-                          <div
-                            key={item.id + idx}
-                            onClick={() => {
-                              if (onSelectFile) onSelectFile(item);
-                            }}
-                            className={`p-2 rounded-xl flex items-center justify-between cursor-pointer transition-colors ${
-                              isCurrent
-                                ? 'bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 font-semibold'
-                                : 'hover:bg-slate-800 text-slate-300'
-                            }`}
-                          >
-                            <div className="flex items-center space-x-2 truncate">
-                              <span className="font-mono text-[10px] text-slate-500 w-4">{idx + 1}</span>
-                              <span className="truncate">{item.name}</span>
-                            </div>
-                            {isCurrent && <Activity className="w-3.5 h-3.5 text-cyan-400 shrink-0 ml-1" />}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                  <QueueMenu
+                    playQueue={playQueue}
+                    currentFileId={file.id}
+                    autoNext={autoNext}
+                    onToggleAutoNext={(val) => {
+                      setAutoNext(val);
+                      localStorage.setItem('gdirect_auto_next', String(val));
+                      showToast(val ? '已开启连播' : '已关闭连播');
+                    }}
+                    onSelectFile={(f) => {
+                      if (onSelectFile) onSelectFile(f);
+                      setShowQueueMenu(false);
+                    }}
+                    onClose={() => setShowQueueMenu(false)}
+                  />
                 )}
               </div>
 
-              {/* Subtitles Popover */}
+              {/* Dual Subtitles Popover */}
               <div className="relative">
                 <button
                   onClick={() => setShowSubtitleMenu(!showSubtitleMenu)}
                   className={`p-1.5 sm:p-2 rounded-xl border transition-colors flex items-center space-x-1 ${
-                    primaryCues.length > 0 || secondaryCues.length > 0
+                    showSubtitleMenu || primaryName !== '无' || secondaryName !== '无'
                       ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
                       : 'bg-white/10 border-transparent text-slate-300 hover:text-white'
                   }`}
-                  title="字幕配置、样式与搜索"
+                  title="字幕设置"
                 >
                   <Subtitles className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
 
                 {showSubtitleMenu && (
-                  <div className="fixed sm:absolute bottom-16 sm:bottom-full left-3 right-3 sm:left-auto sm:right-0 mb-3 w-auto sm:w-[460px] rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-4 z-50 text-xs space-y-3">
-                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                      <div className="flex items-center space-x-2">
-                        <span className="font-bold text-white">双字幕控制与检索中心</span>
-                      </div>
-                      <button onClick={() => setShowSubtitleMenu(false)} className="text-slate-500 hover:text-slate-300">
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Active Subtitle Status Badges */}
-                    <div className="grid grid-cols-2 gap-2 p-2 rounded-xl bg-slate-950 border border-slate-800 text-[11px]">
-                      <div className="flex items-center justify-between overflow-hidden">
-                        <span className="text-cyan-400 font-semibold shrink-0 mr-1.5">主:</span>
-                        <span className="truncate text-slate-200" title={primaryName}>{primaryName}</span>
-                        {primaryCues.length > 0 && (
-                          <button
-                            onClick={() => {
-                              setPrimaryCues([]);
-                              setPrimaryName('无');
-                              setPrimarySubId(null);
-                              persistSubtitleMemory(null, '无', secondarySubId, secondaryName, subOffsetSecs);
-                            }}
-                            className="text-slate-500 hover:text-rose-400 ml-1 shrink-0"
-                            title="卸载主字幕"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        )}
-                      </div>
-                      <div className="flex items-center justify-between overflow-hidden">
-                        <span className="text-amber-400 font-semibold shrink-0 mr-1.5">副:</span>
-                        <span className="truncate text-slate-200" title={secondaryName}>{secondaryName}</span>
-                        {secondaryCues.length > 0 && (
-                          <button
-                            onClick={() => {
-                              setSecondaryCues([]);
-                              setSecondaryName('无');
-                              setSecondarySubId(null);
-                              persistSubtitleMemory(primarySubId, primaryName, null, '无', subOffsetSecs);
-                            }}
-                            className="text-slate-500 hover:text-rose-400 ml-1 shrink-0"
-                            title="卸载副字幕"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Subtitle Tabs */}
-                    <div className="flex space-x-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-[11px]">
-                      <button
-                        onClick={() => setSubTab('folder')}
-                        className={`flex-1 py-1 rounded-lg ${
-                          subTab === 'folder' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        同目录 ({sameFolderSubtitles.length})
-                      </button>
-                      <button
-                        onClick={() => setSubTab('embedded')}
-                        className={`flex-1 py-1 rounded-lg flex items-center justify-center space-x-1 ${
-                          subTab === 'embedded' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        <Film className="w-3 h-3" />
-                        <span>内嵌轨{embeddedTracks.length > 0 ? ` (${embeddedTracks.length})` : ''}</span>
-                      </button>
-                      <button
-                        onClick={() => setSubTab('online')}
-                        className={`flex-1 py-1 rounded-lg ${
-                          subTab === 'online' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        全盘搜索
-                      </button>
-                      <button
-                        onClick={() => setSubTab('style')}
-                        className={`flex-1 py-1 rounded-lg flex items-center justify-center space-x-1 ${
-                          subTab === 'style' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        <Palette className="w-3 h-3" />
-                        <span>外观设置</span>
-                      </button>
-                      <button
-                        onClick={() => setSubTab('sources')}
-                        className={`flex-1 py-1 rounded-lg ${
-                          subTab === 'sources' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        源配置
-                      </button>
-                      <button
-                        onClick={() => setSubTab('paste')}
-                        className={`flex-1 py-1 rounded-lg ${
-                          subTab === 'paste' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400'
-                        }`}
-                      >
-                        上传
-                      </button>
-                    </div>
-
-                    {/* Tab: Embedded Tracks */}
-                    {subTab === 'embedded' && (
-                      <div className="space-y-3 max-h-56 overflow-y-auto">
-                        {embeddedTracks.length > 0 ? (
-                          <div className="space-y-2">
-                            <div className="text-[11px] text-slate-400">
-                              检测到视频封装内嵌 {embeddedTracks.length} 个字幕轨道 (Web 原生解析)：
-                            </div>
-                            {embeddedTracks.map((trk) => (
-                              <div
-                                key={trk.index}
-                                className={`p-2.5 rounded-xl border flex items-center justify-between gap-2 ${
-                                  activeEmbeddedTrack === trk.index
-                                    ? 'bg-cyan-500/10 border-cyan-500/40 text-cyan-300'
-                                    : 'bg-slate-950 border-slate-800 text-slate-200'
-                                }`}
-                              >
-                                <div className="flex flex-col">
-                                  <span className="font-semibold text-xs flex items-center space-x-1.5">
-                                    <span>{trk.label}</span>
-                                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">
-                                      {trk.language}
-                                    </span>
-                                    {activeEmbeddedTrack === trk.index && (
-                                      <span className="text-[10px] text-cyan-400 font-mono">激活中</span>
-                                    )}
-                                  </span>
-                                  <span className="text-[10px] text-slate-500">类型: {trk.kind}</span>
-                                </div>
-                                <div className="flex space-x-1 shrink-0">
-                                  <button
-                                    onClick={() => handleSelectEmbeddedTrack(trk.index, 'primary')}
-                                    className="px-2.5 py-1 rounded-lg bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500 hover:text-slate-950 text-xs font-semibold"
-                                  >
-                                    设为主
-                                  </button>
-                                  <button
-                                    onClick={() => handleSelectEmbeddedTrack(trk.index, 'secondary')}
-                                    className="px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 hover:bg-amber-500 hover:text-slate-950 text-xs font-semibold"
-                                  >
-                                    设为副
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3 text-center">
-                            <div className="text-slate-400 text-xs">
-                              未检测到内嵌文本字幕轨
-                            </div>
-                            <button
-                              onClick={() => {
-                                setShowSubtitleMenu(false);
-                                setShowExternalModal(true);
-                              }}
-                              className="w-full py-2 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-300 font-semibold text-xs flex items-center justify-center space-x-1.5"
-                            >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                              <span>外部播放器播放 (支持图形/内嵌字幕硬解)</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Tab 1: Same Folder Discovery */}
-                    {subTab === 'folder' && (
-                      <div className="space-y-2 max-h-48 overflow-y-auto">
-                        {sameFolderSubtitles.length === 0 ? (
-                          <div className="text-slate-500 py-3 text-center">同目录下未探测到字幕文件</div>
-                        ) : (
-                          sameFolderSubtitles.map((sub) => (
-                            <div key={sub.id} className="p-2 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
-                              <span className="break-words text-xs text-slate-200 line-clamp-2 leading-relaxed" title={sub.name}>
-                                {sub.name}
-                              </span>
-                              <div className="flex space-x-1 shrink-0">
-                                <button
-                                  onClick={() => loadDriveSubtitle(sub, 'primary')}
-                                  className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500 hover:text-slate-950 font-semibold"
-                                >
-                                  设为主
-                                </button>
-                                <button
-                                  onClick={() => loadDriveSubtitle(sub, 'secondary')}
-                                  className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 hover:bg-amber-500 hover:text-slate-950 font-semibold"
-                                >
-                                  设为副
-                                </button>
-                              </div>
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    )}
-
-                    {/* Tab 2: Full Drive & Multi-Source Search */}
-                    {subTab === 'online' && (
-                      <div className="space-y-2">
-                        <div className="flex space-x-1.5">
-                          <input
-                            type="text"
-                            value={searchKeyword}
-                            onChange={(e) => setSearchKeyword(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && handleOnlineSearch()}
-                            placeholder="输入电影名称或字幕关键词"
-                            className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white"
-                          />
-                          <button
-                            onClick={handleOnlineSearch}
-                            disabled={searchLoading}
-                            className="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold"
-                          >
-                            {searchLoading ? '检索中...' : '搜索'}
-                          </button>
-                        </div>
-
-                        <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                          {searchResults.length === 0 && !searchLoading ? (
-                            <div className="text-slate-500 text-center py-4">
-                              输入片名回车，自动递归穿透检索 5TB 全盘及已配置外部源
-                            </div>
-                          ) : (
-                            searchResults.map((item) => (
-                              <div key={item.id} className="p-2 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
-                                <div className="overflow-hidden flex-1">
-                                  <p className="break-words text-xs text-slate-200 line-clamp-2 leading-relaxed">{item.name}</p>
-                                  <div className="flex items-center space-x-2 mt-0.5">
-                                    <span className="text-[10px] text-cyan-400">{item.lang}</span>
-                                    <span className="text-[10px] text-slate-500 font-mono">[{item.source}]</span>
-                                  </div>
-                                </div>
-                                <div className="flex space-x-1 shrink-0">
-                                  <button
-                                    onClick={() => {
-                                      const apply = (cues: SubtitleCue[]) => {
-                                        setPrimaryCues(cues);
-                                        setPrimaryName(item.name);
-                                        setPrimarySubId(item.id);
-                                        persistSubtitleMemory(item.id, item.name, secondarySubId, secondaryName, subOffsetSecs);
-                                        showToast(`已设为主字幕 (${cues.length}条)`);
-                                      };
-                                      if (item.content) {
-                                        apply(parseSubtitle(item.content));
-                                      } else if (item.url) {
-                                        fetch(item.url)
-                                          .then((r) => r.text())
-                                          .then((t) => apply(parseSubtitle(t)));
-                                      }
-                                    }}
-                                    className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-semibold hover:bg-cyan-500 hover:text-slate-950"
-                                  >
-                                    主
-                                  </button>
-                                  <button
-                                    onClick={() => {
-                                      const apply = (cues: SubtitleCue[]) => {
-                                        setSecondaryCues(cues);
-                                        setSecondaryName(item.name);
-                                        setSecondarySubId(item.id);
-                                        persistSubtitleMemory(primarySubId, primaryName, item.id, item.name, subOffsetSecs);
-                                        showToast(`已设为副字幕 (${cues.length}条)`);
-                                      };
-                                      if (item.content) {
-                                        apply(parseSubtitle(item.content));
-                                      } else if (item.url) {
-                                        fetch(item.url)
-                                          .then((r) => r.text())
-                                          .then((t) => apply(parseSubtitle(t)));
-                                      }
-                                    }}
-                                    className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold hover:bg-amber-500 hover:text-slate-950"
-                                  >
-                                    副
-                                  </button>
-                                </div>
-                              </div>
-                            ))
-                          )}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tab 3: Subtitle Appearance Customization (NEW) */}
-                    {subTab === 'style' && (
-                      <div className="space-y-3 max-h-56 overflow-y-auto pr-1">
-                        {/* Font Size */}
-                        <div className="space-y-1">
-                          <div className="flex justify-between items-center text-slate-300">
-                            <span>字体大小</span>
-                            <span className="font-mono text-cyan-400 font-bold">{subStyle.fontSize}px</span>
-                          </div>
-                          <div className="flex items-center space-x-1.5">
-                            {[16, 20, 24, 28, 34].map((sz) => (
-                              <button
-                                key={sz}
-                                onClick={() => updateSubStyle({ fontSize: sz })}
-                                className={`flex-1 py-1 rounded-lg border text-center font-mono ${
-                                  subStyle.fontSize === sz
-                                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300 font-bold'
-                                    : 'bg-slate-950 border-slate-800 text-slate-400'
-                                }`}
-                              >
-                                {sz}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Colors */}
-                        <div className="grid grid-cols-2 gap-2.5">
-                          <div className="space-y-1">
-                            <span className="text-slate-300 block">主字幕颜色</span>
-                            <div className="flex space-x-1.5">
-                              {['#FFFFFF', '#FACC15', '#22D3EE', '#4ADE80'].map((c) => (
-                                <button
-                                  key={c}
-                                  onClick={() => updateSubStyle({ primaryColor: c })}
-                                  style={{ backgroundColor: c }}
-                                  className={`w-6 h-6 rounded-full border-2 transition-transform ${
-                                    subStyle.primaryColor === c ? 'scale-110 border-white shadow-lg' : 'border-slate-800'
-                                  }`}
-                                />
-                              ))}
-                            </div>
-                          </div>
-                          <div className="space-y-1">
-                            <span className="text-slate-300 block">副字幕颜色</span>
-                            <div className="flex space-x-1.5">
-                              {['#FDE047', '#38BDF8', '#C084FC', '#CBD5E1'].map((c) => (
-                                <button
-                                  key={c}
-                                  onClick={() => updateSubStyle({ secondaryColor: c })}
-                                  style={{ backgroundColor: c }}
-                                  className={`w-6 h-6 rounded-full border-2 transition-transform ${
-                                    subStyle.secondaryColor === c ? 'scale-110 border-white shadow-lg' : 'border-slate-800'
-                                  }`}
-                                />
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Background & Outline Style */}
-                        <div className="space-y-1">
-                          <span className="text-slate-300 block">描边与背景风格</span>
-                          <div className="grid grid-cols-4 gap-1.5">
-                            {[
-                              { id: 'box', label: '黑底胶囊' },
-                              { id: 'stroke', label: '浓郁描边' },
-                              { id: 'shadow', label: '柔和阴影' },
-                              { id: 'none', label: '无底色' },
-                            ].map((item) => (
-                              <button
-                                key={item.id}
-                                onClick={() => updateSubStyle({ bgStyle: item.id as any })}
-                                className={`py-1 rounded-lg border text-center text-[10px] ${
-                                  subStyle.bgStyle === item.id
-                                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300 font-bold'
-                                    : 'bg-slate-950 border-slate-800 text-slate-400'
-                                }`}
-                              >
-                                {item.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Bottom Distance */}
-                        <div className="space-y-1">
-                          <div className="flex justify-between items-center text-slate-300">
-                            <span>底部垂直间距</span>
-                            <span className="font-mono text-cyan-400">{subStyle.bottomOffset}px</span>
-                          </div>
-                          <div className="flex items-center space-x-1.5">
-                            {[40, 60, 80, 110, 140].map((ofst) => (
-                              <button
-                                key={ofst}
-                                onClick={() => updateSubStyle({ bottomOffset: ofst })}
-                                className={`flex-1 py-1 rounded-lg border text-center text-[10px] font-mono ${
-                                  subStyle.bottomOffset === ofst
-                                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300 font-bold'
-                                    : 'bg-slate-950 border-slate-800 text-slate-400'
-                                }`}
-                              >
-                                {ofst}px
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Bilingual Split Switch */}
-                        <div className="pt-1 flex items-center justify-between text-slate-300">
-                          <span className="text-[11px]">单字幕双语拆分分色 (中英自动排版)</span>
-                          <input
-                            type="checkbox"
-                            checked={subStyle.bilingualSplit}
-                            onChange={(e) => updateSubStyle({ bilingualSplit: e.target.checked })}
-                            className="accent-cyan-400 rounded cursor-pointer"
-                          />
-                        </div>
-
-                        {/* Live Preview Box */}
-                        <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 text-center space-y-1">
-                          <span className="text-[10px] text-slate-500 block">实时样式预览效果</span>
-                          <div className="flex flex-col items-center space-y-1 py-1">
-                            <span style={getSubtitleItemStyle('secondary')}>
-                              Sample English Subtitle Preview
-                            </span>
-                            <span style={getSubtitleItemStyle('primary')}>
-                              字幕样式与大小实时渲染预览效果
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tab 4: Custom Subtitle Sources */}
-                    {subTab === 'sources' && (
-                      <div className="space-y-3">
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-slate-300 font-medium">配置自定义字幕 Webhook / API 地址</label>
-                          <div className="flex space-x-1.5">
-                            <input
-                              type="text"
-                              value={customSourceUrl}
-                              onChange={(e) => setCustomSourceUrl(e.target.value)}
-                              placeholder="https://api.example.com/subtitles?q={query}"
-                              className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white font-mono"
-                            />
-                            <button
-                              onClick={() => handleAddCustomSource(customSourceUrl)}
-                              className="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold"
-                            >
-                              保存
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="space-y-1 text-slate-400 text-[11px]">
-                          <span className="font-semibold text-slate-200">当前激活的字幕搜索源:</span>
-                          <div className="space-y-1 mt-1">
-                            <div className="p-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 flex items-center justify-between">
-                              <span>Google Drive 全盘深度递归索引</span>
-                              <span className="text-emerald-400 font-mono">内置</span>
-                            </div>
-                            {customSourceUrl && (
-                              <div className="p-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 flex items-center justify-between">
-                                <span className="truncate max-w-[260px] font-mono text-[10px]">{customSourceUrl}</span>
-                                <span className="text-cyan-400 font-mono">自定义</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tab 5: Local Upload */}
-                    {subTab === 'paste' && (
-                      <div className="space-y-2">
-                        <label className="w-full flex items-center justify-center space-x-1.5 py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 cursor-pointer font-medium">
-                          <Upload className="w-4 h-4" />
-                          <span>选择本地 .srt / .vtt / .ass / .ssa 文件</span>
-                          <input
-                            type="file"
-                            accept=".srt,.vtt,.ass,.ssa"
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                const reader = new FileReader();
-                                reader.onload = (ev) => {
-                                  const text = ev.target?.result as string;
-                                  const parsed = parseSubtitle(text);
-                                  setPrimaryCues(parsed);
-                                  setPrimaryName(f.name);
-                                  showToast(`已加载主字幕: ${f.name} (${parsed.length}条)`);
-                                };
-                                reader.readAsText(f);
-                              }
-                            }}
-                            className="hidden"
-                          />
-                        </label>
-                      </div>
-                    )}
-
-                    {/* Sync Offset */}
-                    <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-slate-400 text-[11px]">
-                      <span>时间轴同步微调:</span>
-                      <div className="flex items-center space-x-1">
-                        <button
-                          onClick={() => {
-                            const next = parseFloat((subOffsetSecs - 0.5).toFixed(1));
-                            setSubOffsetSecs(next);
-                            persistSubtitleMemory(primarySubId, primaryName, secondarySubId, secondaryName, next);
-                          }}
-                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono"
-                        >
-                          -0.5s
-                        </button>
-                        <span className="font-mono text-cyan-300 px-1">{subOffsetSecs}s</span>
-                        <button
-                          onClick={() => {
-                            const next = parseFloat((subOffsetSecs + 0.5).toFixed(1));
-                            setSubOffsetSecs(next);
-                            persistSubtitleMemory(primarySubId, primaryName, secondarySubId, secondaryName, next);
-                          }}
-                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono"
-                        >
-                          +0.5s
-                        </button>
-                        {subOffsetSecs !== 0 && (
-                          <button
-                            onClick={() => {
-                              setSubOffsetSecs(0);
-                              persistSubtitleMemory(primarySubId, primaryName, secondarySubId, secondaryName, 0);
-                            }}
-                            className="text-[10px] text-slate-500 hover:text-slate-300 px-1"
-                          >
-                            复位
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                  <SubtitleMenu
+                    file={file}
+                    sameFolderSubtitles={sameFolderSubtitles}
+                    embeddedTracks={embeddedTracks}
+                    activeEmbeddedTrack={activeEmbeddedTrack}
+                    primaryName={primaryName}
+                    secondaryName={secondaryName}
+                    primarySubId={primarySubId}
+                    secondarySubId={secondarySubId}
+                    subOffsetSecs={subOffsetSecs}
+                    subStyle={subStyle}
+                    customSourceUrl={customSourceUrl}
+                    subtitleSources={subtitleSources}
+                    cleanTitle={cleanTitle}
+                    tokenParam={tokenParam}
+                    onSelectEmbeddedTrack={handleSelectEmbeddedTrack}
+                    onSelectSubtitleFile={(sub, target) => {
+                      loadSubById(sub.id, sub.name, target).then((ok) => {
+                        if (ok) {
+                          if (target === 'primary') {
+                            persistSubtitleMemory(sub.id, sub.name, secondarySubId, secondaryName, subOffsetSecs);
+                            showToast(`主字幕: ${sub.name}`);
+                          } else {
+                            persistSubtitleMemory(primarySubId, primaryName, sub.id, sub.name, subOffsetSecs);
+                            showToast(`副字幕: ${sub.name}`);
+                          }
+                        }
+                      });
+                    }}
+                    onApplyParsedCues={(cues, name, id, target) => {
+                      if (target === 'primary') {
+                        setPrimaryCues(cues);
+                        setPrimaryName(name);
+                        setPrimarySubId(id);
+                        persistSubtitleMemory(id, name, secondarySubId, secondaryName, subOffsetSecs);
+                        showToast(`主字幕已加载 (${cues.length}条)`);
+                      } else {
+                        setSecondaryCues(cues);
+                        setSecondaryName(name);
+                        setSecondarySubId(id);
+                        persistSubtitleMemory(primarySubId, primaryName, id, name, subOffsetSecs);
+                        showToast(`副字幕已加载 (${cues.length}条)`);
+                      }
+                      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
+                    }}
+                    onClearSubtitle={(target) => {
+                      if (target === 'primary') {
+                        setPrimaryCues([]);
+                        setPrimaryName('无');
+                        setPrimarySubId(null);
+                        persistSubtitleMemory(null, '无', secondarySubId, secondaryName, subOffsetSecs);
+                      } else {
+                        setSecondaryCues([]);
+                        setSecondaryName('无');
+                        setSecondarySubId(null);
+                        persistSubtitleMemory(primarySubId, primaryName, null, '无', subOffsetSecs);
+                      }
+                      showToast('已卸载字幕');
+                    }}
+                    onUpdateSubStyle={updateSubStyle}
+                    onUpdateOffset={(delta, reset) => {
+                      const next = reset ? 0 : parseFloat((subOffsetSecs + delta).toFixed(1));
+                      setSubOffsetSecs(next);
+                      persistSubtitleMemory(primarySubId, primaryName, secondarySubId, secondaryName, next);
+                    }}
+                    onSaveCustomSource={handleAddCustomSource}
+                    onClose={() => setShowSubtitleMenu(false)}
+                    showToast={showToast}
+                  />
                 )}
               </div>
 
@@ -2202,7 +1632,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 </button>
 
                 {showSpeedMenu && (
-                  <div className="absolute bottom-full right-0 mb-2 w-28 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1 z-40 text-xs">
+                  <div className="absolute bottom-full right-0 mb-2 w-28 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1 z-40 text-xs animate-fade-in">
                     {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((rate) => (
                       <button
                         key={rate}
@@ -2242,11 +1672,11 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                       ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
                       : 'bg-white/10 hover:bg-white/20'
                   }`}
-                  title="画面比例与裁剪模式 (快捷键 C 循环切换)"
+                  title="画面比例与裁剪 (快捷键 C)"
                 >
                   <RectangleHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                   <span className="hidden md:inline text-[10px] font-mono font-semibold uppercase">
-                    {aspectRatio === 'contain' ? '适配' : aspectRatio === 'cover' ? '铺满' : aspectRatio}
+                    {aspectRatio === 'contain' ? '原画' : aspectRatio === 'cover' ? '铺满' : aspectRatio}
                   </span>
                 </button>
 
@@ -2254,15 +1684,15 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                   <div className="absolute bottom-full right-0 mb-2 w-52 bg-slate-900/95 backdrop-blur-md border border-slate-800 rounded-2xl shadow-2xl p-2 space-y-1 z-50 text-xs animate-fade-in">
                     <div className="px-2 py-1 text-[10px] text-slate-400 font-semibold border-b border-slate-800 flex items-center justify-between">
                       <span>画面比例模式</span>
-                      <span className="text-slate-500 font-mono">按 C 切换</span>
+                      <span className="text-slate-500 font-mono">按 C 循环</span>
                     </div>
                     {[
-                      { id: 'contain', label: '最佳适配 (完整不裁切)', desc: '默认模式，黑边自适应' },
+                      { id: 'contain', label: '最佳原画 (完整零裁切)', desc: '默认模式，黑边自适应' },
                       { id: 'cover', label: '智能铺满 (去除黑边)', desc: '居中裁剪铺满屏幕' },
-                      { id: 'fill', label: '拉伸铺满 (撑满视口)', desc: '不保持原比例拉伸' },
-                      { id: '16:9', label: '16:9 标准宽屏', desc: '现代电视及宽屏显示器' },
-                      { id: '4:3', label: '4:3 经典方屏', desc: '经典老番与复古电影' },
-                      { id: '21:9', label: '21:9 影院超宽银幕', desc: '院线宽银幕适配' },
+                      { id: 'fill', label: '拉伸全屏', desc: '填满视口忽略原比例' },
+                      { id: '16:9', label: '16:9 标准宽屏', desc: '现代电视及宽屏显示' },
+                      { id: '4:3', label: '4:3 经典方屏', desc: '经典老片与复古动画' },
+                      { id: '21:9', label: '21:9 影院超宽银幕', desc: '院线电影银幕适配' },
                     ].map((item) => (
                       <button
                         key={item.id}
@@ -2282,7 +1712,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 )}
               </div>
 
-              {/* Picture in Picture (Mobile & Desktop) */}
+              {/* Picture-in-Picture (Available on both desktop & mobile) */}
               <button
                 onClick={togglePiP}
                 className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white transition-colors"
@@ -2291,12 +1721,12 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                 <PictureInPicture className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
               </button>
 
-              {/* Native System Player for iOS / Mobile */}
+              {/* iOS / Mobile Native Player Handoff */}
               {(isMobile || isIOS) && (
                 <button
                   onClick={enterNativeSystemPlayer}
                   className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-white/20 text-cyan-300 hover:text-white transition-colors"
-                  title="唤起系统原生播放器 (支持 iOS 原生 PiP/AirPlay)"
+                  title="iOS 原生系统播放器 (支持 AirPlay 与系统画中画)"
                 >
                   <Smartphone className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
@@ -2316,84 +1746,12 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
         {/* External Player Callout Modal */}
         {showExternalModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
-            <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-2xl">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <div className="flex items-center space-x-2">
-                  <ExternalLink className="w-4 h-4 text-cyan-400" />
-                  <h3 className="text-base font-bold text-white">调用外部播放器</h3>
-                </div>
-                <button onClick={() => setShowExternalModal(false)} className="text-slate-400 hover:text-white">
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs font-semibold">
-                <a
-                  href={`vlc://${streamUrl}`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-orange-500/50 text-orange-300 text-center transition-all block"
-                >
-                  <Tv className="w-4 h-4 mx-auto mb-1 text-orange-400" />
-                  <span>VLC Media Player</span>
-                </a>
-                <a
-                  href={`iina://weblink?url=${encodeURIComponent(streamUrl)}`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-blue-500/50 text-blue-300 text-center transition-all block"
-                >
-                  <Film className="w-4 h-4 mx-auto mb-1 text-blue-400" />
-                  <span>IINA (Mac)</span>
-                </a>
-                <a
-                  href={`infuse://x-callback-url/open?url=${encodeURIComponent(streamUrl)}`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-amber-500/50 text-amber-300 text-center transition-all block"
-                >
-                  <Play className="w-4 h-4 mx-auto mb-1 text-amber-400" />
-                  <span>Infuse (iOS/Mac)</span>
-                </a>
-                <a
-                  href={`nplayer-${streamUrl}`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-cyan-500/50 text-cyan-300 text-center transition-all block"
-                >
-                  <Activity className="w-4 h-4 mx-auto mb-1 text-cyan-400" />
-                  <span>nPlayer</span>
-                </a>
-                <a
-                  href={`intent:${streamUrl}#Intent;type=video/*;package=com.mxtech.videoplayer.ad;end`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-emerald-500/50 text-emerald-300 text-center transition-all block"
-                >
-                  <Smartphone className="w-4 h-4 mx-auto mb-1 text-emerald-400" />
-                  <span>MX Player (Android)</span>
-                </a>
-                <a
-                  href={`potplayer://${streamUrl}`}
-                  className="p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-purple-500/50 text-purple-300 text-center transition-all block"
-                >
-                  <Tv className="w-4 h-4 mx-auto mb-1 text-purple-400" />
-                  <span>PotPlayer (Win)</span>
-                </a>
-              </div>
-
-              <div className="pt-2 border-t border-slate-800 space-y-2">
-                <span className="text-[11px] text-slate-400 block font-medium">快速复制直链:</span>
-                <div className="flex space-x-2">
-                  <button
-                    onClick={() => handleCopyUrl(streamUrl)}
-                    className="flex-1 py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 flex items-center justify-center space-x-1.5 transition-colors"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>网关直连 (免翻墙)</span>
-                  </button>
-                  <button
-                    onClick={() => handleCopyUrl(official302Url)}
-                    className="flex-1 py-2 px-3 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-xs font-semibold flex items-center justify-center space-x-1.5 transition-colors"
-                  >
-                    <Globe className="w-3.5 h-3.5" />
-                    <span>官方直链 (需梯子)</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
+          <ExternalPlayerModal
+            streamUrl={streamUrl}
+            official302Url={official302Url}
+            onClose={() => setShowExternalModal(false)}
+            showToast={showToast}
+          />
         )}
       </div>
     </div>
