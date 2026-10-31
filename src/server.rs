@@ -711,12 +711,13 @@ fn recover_best_api(state: &AppState) -> Option<Api> {
     let best = db.best_route().ok()??;
     let current_account = state.api.read().unwrap().account.clone();
     let google = crate::ranges::current(&db);
-    let backups: Vec<crate::api::Endpoint> = scan::usable(db.routes(16).unwrap_or_default(), &google, false)
-        .into_iter()
-        .filter(|r| r.ip != best.ip)
-        .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
-        .take(8)
-        .collect();
+    let backups: Vec<crate::api::Endpoint> =
+        scan::usable(db.routes(16).unwrap_or_default(), &google, false)
+            .into_iter()
+            .filter(|r| r.ip != best.ip)
+            .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
+            .take(8)
+            .collect();
 
     let new_api = Api::new(
         state.db_path.clone(),
@@ -724,9 +725,14 @@ fn recover_best_api(state: &AppState) -> Option<Api> {
         Some(best.ip),
         (!best.sni.is_empty()).then_some(best.sni.clone()),
         true,
-    ).ok()?.with_backups(backups);
+    )
+    .ok()?
+    .with_backups(backups);
 
-    let _ = state.engine.client().switch_route(Some(best.ip), (!best.sni.is_empty()).then_some(best.sni));
+    let _ = state
+        .engine
+        .client()
+        .switch_route(Some(best.ip), (!best.sni.is_empty()).then_some(best.sni));
     if let Ok(mut lock) = state.api.write() {
         *lock = new_api.clone();
     }
@@ -752,7 +758,9 @@ async fn api_drive_files(
             // Self-healing: if current endpoint failed or timed out, auto-failover to best verified route
             if let Some(fallback_api) = recover_best_api(&state) {
                 let fld = folder.clone();
-                if let Ok(Ok(recovered_files)) = tokio::task::spawn_blocking(move || fallback_api.list(&fld)).await {
+                if let Ok(Ok(recovered_files)) =
+                    tokio::task::spawn_blocking(move || fallback_api.list(&fld)).await
+                {
                     return (StatusCode::OK, axum::Json(recovered_files)).into_response();
                 }
             }
@@ -788,13 +796,17 @@ async fn api_drive_search(
         _ => {
             if let Some(fallback_api) = recover_best_api(&state) {
                 let q_str = q.clone();
-                if let Ok(Ok(recovered_files)) = tokio::task::spawn_blocking(move || fallback_api.search_files(&q_str)).await {
+                if let Ok(Ok(recovered_files)) =
+                    tokio::task::spawn_blocking(move || fallback_api.search_files(&q_str)).await
+                {
                     return (StatusCode::OK, axum::Json(recovered_files)).into_response();
                 }
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": "Search failed. All direct endpoints failed."})),
+                axum::Json(
+                    serde_json::json!({"error": "Search failed. All direct endpoints failed."}),
+                ),
             )
                 .into_response();
         }

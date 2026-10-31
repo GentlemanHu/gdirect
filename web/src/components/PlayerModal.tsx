@@ -233,6 +233,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return playQueue.findIndex((item) => item.id === file.id);
   }, [playQueue, file.id]);
 
+  // Reset playback intent when a new file/episode loads
+  useEffect(() => {
+    userPausedRef.current = false;
+    setIsUserPaused(false);
+    setIsPlaying(false);
+    setIsBuffering(true);
+    setHasPlayedFirstFrame(false);
+    setVideoError(null);
+  }, [file.id]);
+
   // Real-time speed from backend
   const [streamSpeedMbps, setStreamSpeedMbps] = useState<string>('0.0');
 
@@ -1102,6 +1112,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             }}
             onPause={() => {
               setIsPlaying(false);
+              if (userPausedRef.current) {
+                setIsUserPaused(true);
+              }
             }}
             onWaiting={() => {
               setIsBuffering(true);
@@ -1116,7 +1129,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
               setRetryCountdown(null);
             }}
             onCanPlay={() => {
-              setIsBuffering(false);
+              if (userPausedRef.current) {
+                setIsBuffering(false);
+              }
             }}
             onLoadedMetadata={(w, h, dur) => {
               setVideoWidth(w);
