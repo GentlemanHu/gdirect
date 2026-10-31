@@ -43,11 +43,12 @@ import {
   saveSubtitleStyle,
   splitBilingualText,
 } from '../utils/subtitles';
-import { AspectRatioMode, EmbeddedTrack, OnlineSubItem } from './player/types';
+import { AspectRatioMode, EmbeddedTrack } from './player/types';
 import { SubtitleMenu } from './player/SubtitleMenu';
 import { QueueMenu } from './player/QueueMenu';
 import { ExternalPlayerModal } from './player/ExternalPlayerModal';
 import { PlayerInfoDrawer } from './player/PlayerInfoDrawer';
+import { VideoJSPlayer, VideoJSPlayerHandle } from './player/VideoJSPlayer';
 
 interface PlayerModalProps {
   file: DriveFile;
@@ -64,8 +65,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   onClose,
   onSelectFile,
 }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const playerHandleRef = useRef<VideoJSPlayerHandle | null>(null);
   const userPausedRef = useRef<boolean>(false);
 
   // Core Playback State
@@ -84,7 +85,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   const [controlsVisible, setControlsVisible] = useState(true);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Interaction feedback ripples & badges
+  // Interaction feedback & Mobile Gestures
   const [centerIconState, setCenterIconState] = useState<'play' | 'pause' | 'forward' | 'backward' | null>(null);
   const [isSpeedBoosted, setIsSpeedBoosted] = useState(false);
   const speedBoostRestoreRateRef = useRef<number>(1);
@@ -303,7 +304,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     setTimeout(() => setCenterIconState(null), 500);
   };
 
-  // Aspect ratio label dictionary
   const aspectLabels: Record<AspectRatioMode, string> = {
     contain: '原画自适应 (零裁切)',
     cover: '铺满屏幕 (裁剪去黑边)',
@@ -327,10 +327,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     showToast(`画面比例: ${aspectLabels[mode]}`);
   };
 
-  // Embedded Subtitle Detection & Track Selection
-  const detectEmbeddedTracks = () => {
-    if (!videoRef.current) return;
-    const tracks = videoRef.current.textTracks;
+  // Text tracks detection from Video.js
+  const handleTextTracksChange = (tracks: TextTrackList) => {
     const list: EmbeddedTrack[] = [];
     for (let i = 0; i < tracks.length; i++) {
       const t = tracks[i];
@@ -345,8 +343,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   };
 
   const handleSelectEmbeddedTrack = (trackIndex: number, target: 'primary' | 'secondary' = 'primary') => {
-    if (!videoRef.current) return;
-    const tracks = videoRef.current.textTracks;
+    const v = playerHandleRef.current?.getVideoElement();
+    if (!v || !v.textTracks) return;
+    const tracks = v.textTracks;
     for (let i = 0; i < tracks.length; i++) {
       tracks[i].mode = 'disabled';
     }
@@ -371,18 +370,9 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   };
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const handleAddTrack = () => detectEmbeddedTracks();
-    video.textTracks.addEventListener('addtrack', handleAddTrack);
-    return () => {
-      video.textTracks.removeEventListener('addtrack', handleAddTrack);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!videoRef.current || activeEmbeddedTrack === null) return;
-    const track = videoRef.current.textTracks[activeEmbeddedTrack];
+    const v = playerHandleRef.current?.getVideoElement();
+    if (!v || activeEmbeddedTrack === null || !v.textTracks) return;
+    const track = v.textTracks[activeEmbeddedTrack];
     if (!track) return;
 
     const handleCueChange = () => {
@@ -427,9 +417,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           setSecondaryName(subName);
           setSecondarySubId(subId);
         }
-        if (videoRef.current) {
-          setCurrentTime(videoRef.current.currentTime);
-        }
+        const v = playerHandleRef.current?.getVideoElement();
+        if (v) setCurrentTime(v.currentTime);
         return cues.length > 0;
       }
     } catch {}
@@ -504,54 +493,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }
   };
 
-  // Buffer Tracking
-  const updateBufferInfo = useCallback(() => {
-    if (!videoRef.current) return;
-    const v = videoRef.current;
-    const curr = v.currentTime;
-    const dur = v.duration;
-    const buf = v.buffered;
-    if (buf.length > 0) {
-      let found = false;
-      for (let i = 0; i < buf.length; i++) {
-        if (buf.start(i) <= curr && curr <= buf.end(i)) {
-          if (dur > 0) setBufferedPercent((buf.end(i) / dur) * 100);
-          setBufferedAheadSecs(Math.max(0, Math.round(buf.end(i) - curr)));
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        const lastEnd = buf.end(buf.length - 1);
-        if (dur > 0) setBufferedPercent((lastEnd / dur) * 100);
-        setBufferedAheadSecs(Math.max(0, Math.round(lastEnd - curr)));
-      }
-    }
-  }, []);
-
-  const handleTimeUpdate = () => {
-    if (!videoRef.current) return;
-    const curr = videoRef.current.currentTime;
-    setCurrentTime(curr);
-
-    const nowSec = Math.floor(curr);
-    if (Math.abs(nowSec - lastSavedTimeRef.current) >= 2) {
-      lastSavedTimeRef.current = nowSec;
-      if (nowSec > 3 && duration > 10) {
-        localStorage.setItem(`gdirect_prog_${file.id}`, nowSec.toString());
-      }
-    }
-
-    updateBufferInfo();
-  };
-
-  const handleVideoEnded = () => {
-    if (autoNext && onSelectFile && playQueue.length > 1) {
-      showToast('本集播放完毕，自动播放下一集');
-      setTimeout(playNextInQueue, 1000);
-    }
-  };
-
   // Subtitle cue matching
   const adjustedTime = currentTime + subOffsetSecs;
 
@@ -611,40 +552,18 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     return base;
   };
 
-  // Safe Play: Strictly checks userPausedRef to prevent unwanted auto-resume after pause!
+  // Safe Play Controller: Strictly locks on userPausedRef to prevent auto-resumption!
   const safePlay = useCallback(() => {
     if (userPausedRef.current) return;
-    const video = videoRef.current;
-    if (!video || !video.paused) return;
-    const playPromise = video.play();
-    if (playPromise !== undefined) {
-      playPromise
-        .then(() => {
-          setIsPlaying(true);
-          setIsUserPaused(false);
-          setIsBuffering(false);
-        })
-        .catch((err) => {
-          if (err.name === 'NotAllowedError') {
-            video.muted = true;
-            setIsMuted(true);
-            video
-              .play()
-              .then(() => {
-                setIsPlaying(true);
-                setIsUserPaused(false);
-                setIsBuffering(false);
-                showToast('已静音播放 (点击音量可开启声音)');
-              })
-              .catch(() => {});
-          }
-        });
-    }
+    const handle = playerHandleRef.current;
+    if (!handle) return;
+    handle.play();
   }, []);
 
   const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (videoRef.current.paused) {
+    const handle = playerHandleRef.current;
+    if (!handle) return;
+    if (!isPlaying) {
       userPausedRef.current = false;
       setIsUserPaused(false);
       safePlay();
@@ -652,37 +571,33 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     } else {
       userPausedRef.current = true;
       setIsUserPaused(true);
-      videoRef.current.pause();
+      handle.pause();
       setIsPlaying(false);
       triggerCenterFeedback('pause');
     }
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!videoRef.current) return;
     const time = parseFloat(e.target.value);
-    videoRef.current.currentTime = time;
+    playerHandleRef.current?.seek(time);
     setCurrentTime(time);
   };
 
   const handleVolume = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!videoRef.current) return;
     const val = parseFloat(e.target.value);
-    videoRef.current.volume = val;
+    playerHandleRef.current?.setVolume(val);
     setVolume(val);
     setIsMuted(val === 0);
   };
 
   const toggleMute = () => {
-    if (!videoRef.current) return;
     const targetMute = !isMuted;
-    videoRef.current.muted = targetMute;
+    playerHandleRef.current?.setMuted(targetMute);
     setIsMuted(targetMute);
   };
 
   const setSpeed = (rate: number) => {
-    if (!videoRef.current) return;
-    videoRef.current.playbackRate = rate;
+    playerHandleRef.current?.setPlaybackRate(rate);
     setPlaybackRate(rate);
     setShowSpeedMenu(false);
     showToast(`${rate}x 速度`);
@@ -700,12 +615,12 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   };
 
   const enterNativeSystemPlayer = () => {
-    if (!videoRef.current) return;
-    const v = videoRef.current as any;
+    const v = playerHandleRef.current?.getVideoElement() as any;
+    if (!v) return;
     try {
       if (typeof v.webkitEnterFullscreen === 'function') {
         v.webkitEnterFullscreen();
-        showToast('唤起系统原生播放器');
+        showToast('唤起系统播放器');
       } else if (v.requestFullscreen) {
         v.requestFullscreen().catch(() => {});
       }
@@ -715,8 +630,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
   };
 
   const togglePiP = async () => {
-    if (!videoRef.current) return;
-    const v = videoRef.current as any;
+    const v = playerHandleRef.current?.getVideoElement() as any;
+    if (!v) return;
     try {
       if (typeof v.webkitSetPresentationMode === 'function') {
         const currentMode = v.webkitPresentationMode;
@@ -735,7 +650,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
         v.webkitEnterFullscreen();
       } else {
         setIsFloating((prev) => !prev);
-        showToast(isFloating ? '全屏展开' : '页面悬浮小窗');
+        showToast(isFloating ? '全屏展开' : '页面悬浮');
       }
     } catch (err) {
       if (typeof v.webkitEnterFullscreen === 'function') {
@@ -759,25 +674,23 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
       setUseOfficial302(next302);
       showToast(next302 ? '已切换至官方 302 线路' : '已切换至国内边缘直连');
     } else {
-      showToast('正在重试视频流连接...');
+      showToast('正在重试视频连接...');
     }
 
-    const cur = currentTime || videoRef.current?.currentTime || 0;
+    const cur = currentTime || 0;
     setTimeout(() => {
-      if (videoRef.current) {
-        videoRef.current.load();
-        videoRef.current.currentTime = cur;
+      const handle = playerHandleRef.current;
+      if (handle) {
+        handle.seek(cur);
         if (!userPausedRef.current) {
-          safePlay();
+          handle.play();
         }
       }
     }, 250);
   };
 
-  const handleVideoError = () => {
-    const err = videoRef.current?.error;
-    const code = err?.code;
-    console.warn('Video playback error:', code, err);
+  const handleVideoError = (code: number | null, msg?: string) => {
+    console.warn('VideoJS error:', code, msg);
 
     if (retryCount < 2) {
       setRetryCount((prev) => prev + 1);
@@ -824,19 +737,15 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           break;
         case 'ArrowLeft':
           e.preventDefault();
-          if (videoRef.current) {
-            videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 5);
-            triggerCenterFeedback('backward');
-            showToast('-5s');
-          }
+          playerHandleRef.current?.seek(Math.max(0, currentTime - 5));
+          triggerCenterFeedback('backward');
+          showToast('-5s');
           break;
         case 'ArrowRight':
           e.preventDefault();
-          if (videoRef.current) {
-            videoRef.current.currentTime = Math.min(duration, videoRef.current.currentTime + 5);
-            triggerCenterFeedback('forward');
-            showToast('+5s');
-          }
+          playerHandleRef.current?.seek(Math.min(duration, currentTime + 5));
+          triggerCenterFeedback('forward');
+          showToast('+5s');
           break;
         case 'KeyF':
           e.preventDefault();
@@ -880,7 +789,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [duration, isPlaying, isMuted, immersiveMode, playQueue, currentQueueIndex, aspectRatio]);
+  }, [duration, currentTime, isPlaying, isMuted, immersiveMode, playQueue, currentQueueIndex, aspectRatio]);
 
   const handleMouseMove = () => {
     setControlsVisible(true);
@@ -890,7 +799,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     }, 2800);
   };
 
-  // Touch and click handlers for mobile & gestures
+  // Mobile touch gestures
   const handleTouchStart = (e: React.TouchEvent) => {
     const touch = e.touches[0];
     const now = Date.now();
@@ -898,21 +807,16 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     const x = touch.clientX - rect.left;
     const width = rect.width;
 
-    // Check double-tap gesture
     if (now - lastTapTimeRef.current.time < 320 && Math.abs(x - lastTapTimeRef.current.x) < 80) {
       if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
       if (x < width * 0.35) {
-        if (videoRef.current) {
-          videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
-          triggerCenterFeedback('backward');
-          showToast('-10s 快退');
-        }
+        playerHandleRef.current?.seek(Math.max(0, currentTime - 10));
+        triggerCenterFeedback('backward');
+        showToast('-10s 快退');
       } else if (x > width * 0.65) {
-        if (videoRef.current) {
-          videoRef.current.currentTime = Math.min(duration, videoRef.current.currentTime + 10);
-          triggerCenterFeedback('forward');
-          showToast('+10s 快进');
-        }
+        playerHandleRef.current?.seek(Math.min(duration, currentTime + 10));
+        triggerCenterFeedback('forward');
+        showToast('+10s 快进');
       } else {
         togglePlay();
       }
@@ -922,13 +826,12 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
     lastTapTimeRef.current = { time: now, x };
 
-    // Long press for 2x speed
-    if (isPlaying && videoRef.current) {
+    if (isPlaying && playerHandleRef.current) {
       if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
       longPressTimerRef.current = setTimeout(() => {
-        if (videoRef.current && isPlaying) {
-          speedBoostRestoreRateRef.current = videoRef.current.playbackRate;
-          videoRef.current.playbackRate = 2.0;
+        if (playerHandleRef.current && isPlaying) {
+          speedBoostRestoreRateRef.current = playbackRate;
+          playerHandleRef.current.setPlaybackRate(2.0);
           setIsSpeedBoosted(true);
         }
       }, 550);
@@ -937,13 +840,13 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
 
   const handleTouchEnd = () => {
     if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-    if (isSpeedBoosted && videoRef.current) {
-      videoRef.current.playbackRate = speedBoostRestoreRateRef.current;
+    if (isSpeedBoosted && playerHandleRef.current) {
+      playerHandleRef.current.setPlaybackRate(speedBoostRestoreRateRef.current);
       setIsSpeedBoosted(false);
     }
   };
 
-  const handleScreenClick = (e: React.MouseEvent) => {
+  const handleScreenClick = () => {
     if (immersiveMode) {
       setControlsVisible(true);
       if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
@@ -961,34 +864,6 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
     showToast('直链已复制');
     setTimeout(() => setCopyFeedback(false), 2000);
   };
-
-  // Accurate CSS geometry based on selected aspect ratio
-  const videoStyle: React.CSSProperties = useMemo(() => {
-    const isCover = aspectRatio === 'cover';
-    const isFill = aspectRatio === 'fill';
-
-    const base: React.CSSProperties = {
-      objectFit: isCover ? 'cover' : isFill ? 'fill' : 'contain',
-      maxWidth: '100%',
-      maxHeight: '100%',
-      width: isCover || isFill ? '100%' : 'auto',
-      height: isCover || isFill ? '100%' : 'auto',
-      margin: 'auto',
-      display: 'block',
-    };
-
-    if (aspectRatio === '16:9') {
-      base.aspectRatio = '16 / 9';
-    } else if (aspectRatio === '4:3') {
-      base.aspectRatio = '4 / 3';
-    } else if (aspectRatio === '21:9') {
-      base.aspectRatio = '21 / 9';
-    } else if (aspectRatio === 'contain' && videoWidth > 0 && videoHeight > 0) {
-      base.aspectRatio = `${videoWidth} / ${videoHeight}`;
-    }
-
-    return base;
-  }, [aspectRatio, videoWidth, videoHeight]);
 
   return (
     <div
@@ -1174,7 +1049,7 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
             <span>上次播放至 {formatTime(resumePrompt.time)}</span>
             <button
               onClick={() => {
-                if (videoRef.current) videoRef.current.currentTime = 0;
+                playerHandleRef.current?.seek(0);
                 setResumePrompt(null);
                 showToast('已从头播放');
               }}
@@ -1191,43 +1066,45 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
           </div>
         )}
 
-        {/* Video Canvas & Subtitles Area (Strictly uncropped layout) */}
+        {/* Video Canvas & Subtitles Area (Powered by Video.js Engine) */}
         <div
           onClick={handleScreenClick}
           onDoubleClick={toggleFullscreen}
           className="relative flex-1 w-full h-full min-h-0 min-w-0 overflow-hidden flex items-center justify-center cursor-pointer bg-black"
         >
-          <video
-            ref={videoRef}
+          <VideoJSPlayer
             src={streamUrl}
-            autoPlay
-            preload="auto"
-            playsInline
-            {...({ 'webkit-playsinline': 'true', 'x5-playsinline': 'true' } as any)}
-            onLoadStart={() => {
-              setIsBuffering(true);
-              setVideoError(null);
+            aspectRatio={aspectRatio}
+            videoWidth={videoWidth}
+            videoHeight={videoHeight}
+            userPausedRef={userPausedRef}
+            onPlayerReady={(handle) => {
+              playerHandleRef.current = handle;
             }}
-            onTimeUpdate={handleTimeUpdate}
-            onProgress={updateBufferInfo}
-            onSeeked={() => {
-              handleTimeUpdate();
-              updateBufferInfo();
+            onTimeUpdate={(curr, dur, bufAhead, bufPct) => {
+              setCurrentTime(curr);
+              setDuration(dur);
+              setBufferedAheadSecs(bufAhead);
+              setBufferedPercent(bufPct);
+
+              const nowSec = Math.floor(curr);
+              if (Math.abs(nowSec - lastSavedTimeRef.current) >= 2) {
+                lastSavedTimeRef.current = nowSec;
+                if (nowSec > 3 && dur > 10) {
+                  localStorage.setItem(`gdirect_prog_${file.id}`, nowSec.toString());
+                }
+              }
+            }}
+            onPlay={() => {
+              setIsPlaying(true);
+              setIsUserPaused(false);
               setIsBuffering(false);
             }}
-            onSeeking={() => {
-              setIsBuffering(true);
+            onPause={() => {
+              setIsPlaying(false);
             }}
             onWaiting={() => {
               setIsBuffering(true);
-            }}
-            onStalled={() => {
-              setIsBuffering(true);
-            }}
-            onLoadedData={() => {
-              handleTimeUpdate();
-              updateBufferInfo();
-              setIsBuffering(false);
             }}
             onPlaying={() => {
               setIsPlaying(true);
@@ -1239,57 +1116,34 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
               setRetryCountdown(null);
             }}
             onCanPlay={() => {
-              handleTimeUpdate();
-              updateBufferInfo();
               setIsBuffering(false);
-              // CRITICAL: Never auto-resume playback if the user paused!
-              if (
-                videoRef.current &&
-                videoRef.current.paused &&
-                !userPausedRef.current &&
-                !videoRef.current.ended
-              ) {
-                safePlay();
-              }
             }}
-            onEnded={handleVideoEnded}
-            onError={handleVideoError}
-            onLoadedMetadata={() => {
+            onLoadedMetadata={(w, h, dur) => {
+              setVideoWidth(w);
+              setVideoHeight(h);
+              setDuration(dur);
               setVideoError(null);
               setIsReconnecting(false);
               setRetryCountdown(null);
-              detectEmbeddedTracks();
-              if (videoRef.current) {
-                const dur = videoRef.current.duration;
-                setDuration(dur);
-                setVideoWidth(videoRef.current.videoWidth);
-                setVideoHeight(videoRef.current.videoHeight);
-                updateBufferInfo();
 
-                const savedStr = localStorage.getItem(`gdirect_prog_${file.id}`);
-                if (savedStr) {
-                  const sec = parseFloat(savedStr);
-                  if (sec > 5 && sec < dur - 10) {
-                    videoRef.current.currentTime = sec;
-                    setCurrentTime(sec);
-                    setResumePrompt({ time: sec });
-                  } else {
-                    setCurrentTime(videoRef.current.currentTime);
-                  }
-                } else {
-                  setCurrentTime(videoRef.current.currentTime);
-                }
-
-                if (!userPausedRef.current) {
-                  safePlay();
+              const savedStr = localStorage.getItem(`gdirect_prog_${file.id}`);
+              if (savedStr) {
+                const sec = parseFloat(savedStr);
+                if (sec > 5 && sec < dur - 10) {
+                  playerHandleRef.current?.seek(sec);
+                  setCurrentTime(sec);
+                  setResumePrompt({ time: sec });
                 }
               }
             }}
-            onPause={() => {
-              setIsPlaying(false);
+            onEnded={() => {
+              if (autoNext && onSelectFile && playQueue.length > 1) {
+                showToast('本集播放完毕，自动播放下一集');
+                setTimeout(playNextInQueue, 1000);
+              }
             }}
-            style={videoStyle}
-            className="transition-all duration-150"
+            onError={handleVideoError}
+            onTextTracksChange={handleTextTracksChange}
           />
 
           {/* Centered Buffering & Speed HUD */}
@@ -1593,7 +1447,8 @@ export const PlayerModal: React.FC<PlayerModalProps> = ({
                         persistSubtitleMemory(primarySubId, primaryName, id, name, subOffsetSecs);
                         showToast(`副字幕已加载 (${cues.length}条)`);
                       }
-                      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
+                      const v = playerHandleRef.current?.getVideoElement();
+                      if (v) setCurrentTime(v.currentTime);
                     }}
                     onClearSubtitle={(target) => {
                       if (target === 'primary') {

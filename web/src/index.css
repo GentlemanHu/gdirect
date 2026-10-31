@@ -9,6 +9,31 @@
   }
 }
 
+/* Video.js quiet engine skin */
+.vjs-custom-skin.video-js {
+  width: 100% !important;
+  height: 100% !important;
+  background-color: transparent !important;
+  font-family: inherit;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+
+.vjs-custom-skin .vjs-tech {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: inherit;
+}
+
+.vjs-custom-skin .vjs-control-bar,
+.vjs-custom-skin .vjs-big-play-button,
+.vjs-custom-skin .vjs-loading-spinner,
+.vjs-custom-skin .vjs-error-display,
+.vjs-custom-skin .vjs-text-track-display {
+  display: none !important;
+}
+
 /* Custom modern scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
