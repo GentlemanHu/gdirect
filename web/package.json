@@ -15,7 +15,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.0.1",
-    "video.js": "^10.2.0",
+    "video.js": "^8.24.2",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

@@ -91,7 +91,7 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
     const container = containerRef.current;
     if (!container) return;
 
-    // Create fresh video tag inside container
+    // Create fresh video tag inside container to let video.js bind cleanly
     const videoElement = document.createElement('video');
     videoElement.className = 'video-js vjs-custom-skin';
     videoElement.playsInline = true;
@@ -102,17 +102,23 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
     container.appendChild(videoElement);
     videoElementRef.current = videoElement;
 
-    const player = (videojs as any)(videoElement, {
-      autoplay: true,
-      controls: false,
-      preload: 'auto',
-      fluid: false,
-      responsive: true,
-      sources: [{ src, type: 'video/mp4' }],
-      poster,
-    });
-
-    playerRef.current = player;
+    let player: any = null;
+    try {
+      player = (videojs as any)(videoElement, {
+        autoplay: true,
+        controls: false,
+        preload: 'auto',
+        fluid: false,
+        responsive: true,
+        sources: [{ src }],
+        poster,
+      });
+      playerRef.current = player;
+    } catch (e: any) {
+      console.warn('VideoJS initialization fallback:', e);
+      onError?.(null, e?.message);
+      return;
+    }
 
     player.ready(() => {
       if (isDisposedRef.current) return;
@@ -120,35 +126,49 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
       const handle: VideoJSPlayerHandle = {
         play: () => {
           if (userPausedRef.current) return;
-          const p = player.play();
-          if (p && typeof p.then === 'function') {
-            p.catch((err: any) => {
-              if (err && err.name === 'NotAllowedError') {
-                player.muted(true);
-                player.play()?.catch(() => {});
-              }
-            });
-          }
+          try {
+            const p = player.play();
+            if (p && typeof p.then === 'function') {
+              p.catch((err: any) => {
+                if (err && err.name === 'NotAllowedError') {
+                  player.muted(true);
+                  player.play()?.catch(() => {});
+                }
+              });
+            }
+          } catch {}
         },
         pause: () => {
-          player.pause();
+          try {
+            player.pause();
+          } catch {}
         },
         seek: (time: number) => {
-          player.currentTime(time);
+          try {
+            player.currentTime(time);
+          } catch {}
         },
         setVolume: (vol: number) => {
-          player.volume(vol);
+          try {
+            player.volume(vol);
+          } catch {}
         },
         setMuted: (muted: boolean) => {
-          player.muted(muted);
+          try {
+            player.muted(muted);
+          } catch {}
         },
         setPlaybackRate: (rate: number) => {
-          player.playbackRate(rate);
+          try {
+            player.playbackRate(rate);
+          } catch {}
         },
         requestFullscreen: () => {
-          if (player.requestFullscreen) {
-            player.requestFullscreen();
-          }
+          try {
+            if (player.requestFullscreen) {
+              player.requestFullscreen();
+            }
+          } catch {}
         },
         getVideoElement: () => videoElementRef.current,
         getPlayer: () => playerRef.current,
@@ -233,18 +253,48 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
         v.textTracks.removeEventListener('addtrack', handleAddTrack);
       }
       if (player && !player.isDisposed()) {
-        player.dispose();
+        try {
+          player.dispose();
+        } catch {}
         playerRef.current = null;
+      }
+      if (container) {
+        container.innerHTML = '';
       }
     };
   }, [src]);
 
-  // Apply responsive CSS style to the video element inside VideoJS
+  // Apply responsive CSS style to the video element and wrapper inside VideoJS
   useEffect(() => {
-    if (videoElementRef.current) {
+    if (playerRef.current && !playerRef.current.isDisposed()) {
+      const el = playerRef.current.el();
+      const tech = playerRef.current.tech()?.el();
+      if (el) {
+        Object.assign(el.style, {
+          width: aspectRatio === 'fill' || aspectRatio === 'cover' ? '100%' : 'auto',
+          height: aspectRatio === 'fill' || aspectRatio === 'cover' ? '100%' : 'auto',
+          maxWidth: '100%',
+          maxHeight: '100%',
+          aspectRatio: videoStyle.aspectRatio,
+          margin: 'auto',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        });
+      }
+      if (tech) {
+        Object.assign(tech.style, {
+          objectFit: videoStyle.objectFit,
+          width: '100%',
+          height: '100%',
+          maxWidth: '100%',
+          maxHeight: '100%',
+        });
+      }
+    } else if (videoElementRef.current) {
       Object.assign(videoElementRef.current.style, videoStyle);
     }
-  }, [videoStyle]);
+  }, [videoStyle, aspectRatio]);
 
   return (
     <div
