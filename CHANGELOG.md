@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.1
+
+### Added
+
+- Non-blocking background Google Edge IP probe on service startup (zero-delay web server boot with automatic asynchronous node benchmarking and SQLite latency ranking).
+- Automatic multi-tier backup failover in `api_client` and `recover_best_api`: eliminates 500 errors when initial endpoint is unreachable or blocked.
+- Full Video.js 8 playback engine integration with cross-platform stability, native aspect ratio sizing, and gesture controls (double-tap 10s seek, long-press 2x speed boost).
+- Universal Picture-in-Picture (PiP) and native iOS AVPlayer handoff for iPhone/iPad Safari.
+- Persistent preferred direct IP selection and user route switching memory.
+
+### Fixed
+
+- Prevent background pre-buffer from auto-resuming playback when paused by user.
+- Fix video aspect ratio crop bug: enforce true native uncropped geometry by default with letterbox adaptation.
+- Remove hardcoded dead relay IP from service scripts to ensure optimal verified Google node binding.
+
 ## 0.9.0
 
 ### Changed

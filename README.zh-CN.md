@@ -50,7 +50,7 @@ docker compose up -d
 在支持 Termux 的 Android 设备（ARM64 / ARMv7）上，直接下载预编译二进制执行：
 ```bash
 # 下载最新 Android aarch64 静态单文件二进制
-curl -fL https://github.com/GentlemanHu/gdirect/releases/latest/download/gdirect-0.9.0-aarch64-linux-android.tar.gz | tar -xz
+curl -fL https://github.com/GentlemanHu/gdirect/releases/latest/download/gdirect-0.9.1-aarch64-linux-android.tar.gz | tar -xz
 chmod +x gdirect
 
 # 启动流媒体网关服务
