@@ -193,6 +193,8 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
+    env:
+      RUSTFLAGS: "-C link-arg=-Wl,--hash-style=both"
     strategy:
       fail-fast: false
       matrix:
