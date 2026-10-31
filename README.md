@@ -49,7 +49,7 @@ Access the web management console at `http://<server-ip>:8080`.
 On Android devices running Termux (ARM64 / ARMv7):
 ```bash
 # Download latest Android static binary
-curl -fL https://github.com/GentlemanHu/gdirect/releases/latest/download/gdirect-0.9.0-aarch64-linux-android.tar.gz | tar -xz
+curl -fL https://github.com/GentlemanHu/gdirect/releases/latest/download/gdirect-0.9.1-aarch64-linux-android.tar.gz | tar -xz
 chmod +x gdirect
 
 # Start streaming gateway

@@ -1235,7 +1235,7 @@ pub fn run_serve(cfg: ServeConfig) -> anyhow::Result<()> {
         start_time: std::time::Instant::now(),
     };
 
-    let router = create_router(state);
+    let router = create_router(state.clone());
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
 
     println!("============================================================");
@@ -1281,6 +1281,29 @@ pub fn run_serve(cfg: ServeConfig) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    // Non-blocking background probe for optimal Google Edge IP
+    let bg_state = state.clone();
+    let bg_db_path = cfg.db_path.clone();
+    rt.spawn(async move {
+        // Yield 2 seconds to let the HTTP/WebDAV server start up immediately without blocking
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(db) = Store::open(&bg_db_path) {
+                let google = crate::ranges::current(&db);
+                let routes = scan::usable(db.routes(8).unwrap_or_default(), &google, false);
+                if routes.is_empty() {
+                    let _ = scan::run(&db, None, false);
+                }
+                if let Some(recovered) = recover_best_api(&bg_state) {
+                    if let Ok(mut lock) = bg_state.api.write() {
+                        *lock = recovered;
+                    }
+                }
+            }
+        })
+        .await;
+    });
 
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
