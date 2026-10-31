@@ -125,7 +125,7 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
 
       const handle: VideoJSPlayerHandle = {
         play: () => {
-          if (userPausedRef.current) return;
+          userPausedRef.current = false;
           try {
             const p = player.play();
             if (p && typeof p.then === 'function') {
@@ -139,6 +139,7 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
           } catch {}
         },
         pause: () => {
+          userPausedRef.current = true;
           try {
             player.pause();
           } catch {}
@@ -177,6 +178,28 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
       if (onPlayerReady) onPlayerReady(handle);
     });
 
+    // Helper: auto-resume playback when enough buffer is available, provided user has NOT paused
+    const tryAutoResume = () => {
+      if (isDisposedRef.current || userPausedRef.current || !player) return;
+      if (player.paused()) {
+        const v = videoElementRef.current;
+        // readyState >= 2 (HAVE_CURRENT_DATA) means media has enough data to render at least current position
+        if (!v || v.readyState >= 2) {
+          try {
+            const p = player.play();
+            if (p && typeof p.then === 'function') {
+              p.catch((err: any) => {
+                if (err && err.name === 'NotAllowedError') {
+                  player.muted(true);
+                  player.play()?.catch(() => {});
+                }
+              });
+            }
+          } catch {}
+        }
+      }
+    };
+
     // Event Bindings
     player.on('timeupdate', () => {
       if (!onTimeUpdate || isDisposedRef.current) return;
@@ -202,21 +225,48 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
         }
       }
       onTimeUpdate(curr, dur, bufferedAhead, bufferedPct);
+
+      // If video was stalled and paused by browser, but we now have buffer ahead, auto-resume
+      if (!userPausedRef.current && player.paused() && (bufferedAhead >= 0.5 || (videoElementRef.current && videoElementRef.current.readyState >= 3))) {
+        tryAutoResume();
+      }
     });
 
     player.on('play', () => onPlay?.());
     player.on('pause', () => onPause?.());
     player.on('waiting', () => onWaiting?.());
     player.on('playing', () => onPlaying?.());
+
+    // Buffer ready signals
     player.on('canplay', () => {
-      if (!userPausedRef.current && player.paused()) {
-        const p = player.play();
-        if (p && typeof p.then === 'function') {
-          p.catch(() => {});
-        }
-      }
+      tryAutoResume();
       onCanPlay?.();
     });
+
+    player.on('canplaythrough', () => {
+      tryAutoResume();
+      onCanPlay?.();
+    });
+
+    player.on('loadeddata', () => {
+      tryAutoResume();
+    });
+
+    player.on('progress', () => {
+      tryAutoResume();
+    });
+
+    // Active stall watchdog: guarantees resumption when chunk download finishes after a stall
+    const stallWatchdog = setInterval(() => {
+      if (isDisposedRef.current || userPausedRef.current || !playerRef.current) return;
+      const p = playerRef.current;
+      if (p.paused()) {
+        const v = videoElementRef.current;
+        if (v && v.readyState >= 2) {
+          tryAutoResume();
+        }
+      }
+    }, 600);
 
     player.on('loadedmetadata', () => {
       const v = videoElementRef.current;
@@ -249,6 +299,7 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
 
     return () => {
       isDisposedRef.current = true;
+      clearInterval(stallWatchdog);
       if (v?.textTracks) {
         v.textTracks.removeEventListener('addtrack', handleAddTrack);
       }
