@@ -91,6 +91,7 @@ impl WebDavTree {
                 modified_time: None,
                 md5_checksum: None,
                 resource_key: None,
+                ..Default::default()
             };
             return Ok((root_file, true));
         }

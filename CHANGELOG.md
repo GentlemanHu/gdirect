@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.13.0
+
+### Added
+
+- Desktop client: Shared with me, Starred, Recent, Trash and shared drives as places in the navigation rail, which expands beside the content from 1200 px wide (with a toggle it remembers) and opens over it in narrower windows. Storage use shows at the foot of the rail and in the account menu.
+- Desktop client: search across all of Drive from the top of the Files page, with type, owner, modified-date and full-text filters and a Location column; "Filter this folder" stays for the current listing.
+- Desktop client: Trash actions (restore, delete forever, empty trash), Undo after moving to trash or moving files (snackbar or ⌘Z), Copy link, Open in browser, Star, and Share; menus show only what Drive allows for each file. Google Docs, Sheets and Slides open in the browser and shortcuts act on their target. Big folders load page by page.
+- Desktop client: a menu bar with File, Edit, View, Go, Window and Help menus and keyboard shortcuts throughout (⌘Q, ⌘1–4, ⌘F, ⌘[ / ⌘], ⇧⌘D/S/R/T for places, arrows, Home/End, Enter, ⌘⌫, F2…), with Finder-style selection. Settings › Keyboard shortcuts lists them all and lets you rebind, reset and resolve clashes.
+- Desktop client: the window remembers its size and position.
+- Arch Linux packages in the AUR: `gdirect-bin` and `gdirect-desktop-bin` from the release assets, `gdirect-git` and `gdirect-desktop-git` built from the repository. Releases update them automatically.
+
+### Changed
+
+- With a TUN-mode proxy or VPN on (sing-box, Clash/Mihomo, WireGuard…), gdirect's connections to Google front ends now leave through the physical network adapter instead of the tunnel, the way sing-box's `auto_detect_interface` escapes its own TUN (macOS `IP_BOUND_IF`, Linux `SO_BINDTODEVICE` with `CAP_NET_RAW`, Windows `IP_UNICAST_IF`). Previously the TUN sniffed the SNI and sent "direct" transfers through the proxy, and the scan measured the proxy, keeping endpoints that were unreachable directly. Scans, Drive API requests, uploads, aria2 downloads, token refresh over endpoints and the proxy `mount` runs for rclone are bound; sign-in and the system-network fallbacks still follow the proxy. On by default: `gdirect scan --bypass-tun off` (or Settings › Network in the desktop client) lets proxy rules decide, and `GDIRECT_BYPASS_TUN=0`/`1` overrides it for one command.
+- Saved endpoints remember the network path they were verified over; after switching the setting, changing adapter, or a TUN coming or going while bypassing is off, they are scanned again before use. `gdirect scan --list` shows how connections leave the machine.
+- Desktop client: the Clash process rule and the "route Google DIRECT" advice in Settings › Network give way to the bypass switch, which shows the adapter in use. The scan's interception warning now points to it.
+- Desktop client: right-click menus everywhere, a responsive Settings page, rclone found outside `PATH` (Homebrew on macOS), clearer sign-in steps, a Chinese-first font for full-width punctuation, natural name sorting, and many layout, focus and wording fixes from several rounds of review.
+
+## 0.12.1
+
+### Added
+
+- Desktop client downloads for every platform: a Windows installer (`gdirect-desktop-windows-x64.msi`: Program Files, a Start menu shortcut, in-place upgrades), a Linux tarball (`gdirect-desktop-linux-x64.tar.gz`, with `install.sh` for a menu entry) and the macOS apps. Their names no longer carry the version, so the README's download buttons always fetch the latest release.
+- Homebrew cask for the desktop app: `brew install --cask mizorewww/gdirect/gdirect-desktop`.
+
+## 0.12.0
+
+### Added
+
+- Desktop client for macOS on the release page: `gdirect-desktop-<version>-aarch64-apple-darwin.zip` and `…-x86_64-apple-darwin.zip` hold a `gdirect.app` (not notarized; allow it once in System Settings). Linux and Windows still build it from source.
+- Desktop client: an English interface. It follows the system language (Chinese for Chinese locales, English otherwise) and can be pinned in Settings › Appearance.
+
+### Changed
+
+- Desktop client: the layout adapts to the window width — columns, the toolbar and the endpoint table give way as the window narrows, and settings switch to one pane at a time — and the window can shrink to 600 × 480.
+
+### Fixed
+
+- Downloads under the forged TLS identity kept the real Host header in one process-wide slot, so with several connections a redirect on one could give another the wrong Host header, and with it the OAuth token on a Drive download host. Each connection now keeps its own.
+
+## 0.11.0
+
+### Added
+
+- A desktop client (preview) in `desktop/`, built with gpui-kit-material and Material Symbols: browse, filter, sort and manage files (new folder, rename, copy, move, trash), queue downloads and uploads (drag files in to upload) with live progress, cancel and resume, scan and pin endpoints (with the TUN interception warning), and manage accounts, mount, download options and appearance. It shares the command line's engine and state. It is built from source and needs gpui-kit-material checked out beside this repository; the release binaries remain the command line only. See "Build from source".
+
+### Changed
+
+- The engine is now a library crate (`gdirect`) that the command and the desktop client both use. `scan` reports its progress through events and can be cancelled, including while it verifies a batch; uploads can be cancelled between chunks and resume later. The command line's behaviour and output are unchanged.
+
+## 0.10.0
+
+### Removed
+
+- Third-party relays. The built-in relay 183.56.143.147, tried first since 0.8.0, now refuses connections (thanks to readers who reported it). gdirect now uses only Google's own front ends: stored endpoints outside Google's address space are ignored, `scan --ips` skips them and `--ip` rejects them. `--google-only` and `GDIRECT_GOOGLE_ONLY` are still accepted but have no effect.
+
+### Changed
+
+- `scan` no longer starts from a built-in list of /24s that worked in testing; such lists go stale. It starts from the endpoints it verified before, then sweeps Google's core front-end blocks. A random batch of those already holds several that work from mainland China, so only the very first scan takes a little longer.
+
+### Added
+
+- `mount` no longer needs a proxy: rclone reaches Google through the scanned IPs via a local proxy that gdirect runs alongside it. The proxy only forwards Google hosts on port 443, TLS stays end to end with the real hostname, and IPs verified with that hostname are used first. `mount` takes `--ip` like the other commands, and falls back to the system network when no IP can be found. Before, mounting from mainland China without a proxy showed no files.
+- IPv6: when the machine has a global IPv6 address, `scan` also sweeps Google's IPv6 front ends, following the address pattern of its regional front ends and moving on to the rest of each /64 that verifies. IPv6 candidates are mixed into the IPv4 sweep, so a network that blocks IPv6 still finds IPv4 endpoints as fast. `--ip` and `scan --ips` accept IPv6 addresses, and downloads work over them. Whether Google's IPv6 front ends are reachable from mainland China has not been measured yet.
+- Recursive folder upload: `gdirect upload DIR --recursive` mirrors a local folder tree under a new Drive folder, including empty folders. An interrupted run resumes with the same command — folders already created are reused and finished files are skipped — and `--restart` starts over with a new Drive folder. Symbolic links and special files inside the folder are skipped. In `browse`, `u` now accepts a folder path and shows live upload progress in the status bar. (Thanks to @December172, #9.)
+
 ## 0.9.1
 
 ### Added

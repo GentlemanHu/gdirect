@@ -113,7 +113,26 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
           components: rustfmt, clippy
-      - uses: msys2/setup-msys2@v2
+      # MSYS2's package mirrors time out now and then; try once more.
+      - id: msys2
+        uses: msys2/setup-msys2@v2
+        continue-on-error: true
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            make patch tar xz diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-python
+      - if: steps.msys2.outcome == 'failure'
+        name: Remove the partial MSYS2 install
+        shell: pwsh
+        run: Remove-Item -Recurse -Force "$env:RUNNER_TEMP\msys64" -ErrorAction SilentlyContinue
+      - if: steps.msys2.outcome == 'failure'
+        uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           path-type: inherit
@@ -189,6 +208,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+<<<<<<< HEAD
   android:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-22.04
@@ -238,9 +258,14 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  desktop:
+    uses: ./.github/workflows/desktop.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+
   publish:
     name: Publish complete release
-    needs: [unix, windows, android]
+    needs: [unix, windows, android, desktop]
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
     runs-on: ubuntu-22.04
     permissions:
@@ -254,7 +279,6 @@ jobs:
           python-version: '3.12'
       - uses: actions/download-artifact@v5
         with:
-          pattern: release-*
           path: dist
           merge-multiple: true
       - name: Validate version, checksums and complete asset set
@@ -277,6 +301,10 @@ jobs:
               ext = 'zip' if 'windows' in target else 'tar.gz'
               assert pathlib.Path(f'dist/gdirect-{version}-{target}.{ext}').is_file(), f'Missing full asset for {target}'
               assert pathlib.Path(f'dist/gdirect-cli-{version}-{target}.{ext}').is_file(), f'Missing cli asset for {target}'
+          for name in ['macos-arm64.zip', 'macos-x64.zip', 'linux-x64.tar.gz', 'windows-x64.msi']:
+              p = pathlib.Path(f'dist/gdirect-desktop-{name}')
+              if p.is_file():
+                  print(f'Desktop asset {name} present')
           PY
           cd dist
           cat ./*.sha256 | tr -d '\r' > SHA256SUMS
@@ -287,7 +315,9 @@ jobs:
         run: |
           mkdir -p source/target/vendor
           git archive HEAD | tar -x -C source
-          curl -fL --retry 3 https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0.tar.xz -o source/target/vendor/aria2-1.37.0.tar.xz
+          # The same tarball as scripts/build-libaria2.sh fetches, with its fallback.
+          curl -fL --retry 3 https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0.tar.xz -o source/target/vendor/aria2-1.37.0.tar.xz \
+            || curl -fL --retry 3 https://src.fedoraproject.org/repo/pkgs/aria2/aria2-1.37.0.tar.xz/sha512/df3b8b4de8fa8d78f203ea00c059e43585e18a229009f202e42e6a9e59db67d09df0dbba8a016e99ed73c82f59e4f8b26f86c2288afdbb96a6807cbe2c56e6b3/aria2-1.37.0.tar.xz -o source/target/vendor/aria2-1.37.0.tar.xz
           echo '60a420ad7085eb616cb6e2bdf0a7206d68ff3d37fb5a956dc44242eb2f79b66b  source/target/vendor/aria2-1.37.0.tar.xz' | sha256sum -c -
           tar -czf "dist/gdirect-${TAG#v}-source.tar.gz" -C source .
           cd dist
@@ -300,19 +330,59 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --verify-tag --draft --title "gdirect $TAG" --generate-notes
           fi
-          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.msi dist/SHA256SUMS --clobber
           gh release edit "$TAG" --draft=false --latest
-      - name: Update Homebrew tap in main
+      - name: Update Homebrew tap and AUR PKGBUILDs in main
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           git fetch origin main
           git checkout -B main origin/main
           python3 scripts/update-homebrew.py --version "${TAG#v}" --checksums dist/SHA256SUMS
+          python3 scripts/update-aur.py --version "${TAG#v}" --checksums dist/SHA256SUMS
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Formula/gdirect.rb
+          git add Formula/gdirect.rb Casks/gdirect-desktop.rb packaging/aur
           if ! git diff --cached --quiet; then
-            git commit -m "brew: update gdirect to ${TAG#v}"
+            git commit -m "packaging: update Homebrew and AUR to ${TAG#v}"
             git push origin HEAD:main
           fi
+
+  aur:
+    name: Publish to AUR
+    needs: [publish]
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Sy --noconfirm git openssh python sudo binutils
+          id builder &>/dev/null || useradd -m builder
+      # Full history and tags, so the -git packages get a describable pkgver.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Setup AUR SSH (builder)
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -dm700 -o builder -g builder /home/builder/.ssh
+          printf '%s\n' "$AUR_KEY" > /home/builder/.ssh/aur_key
+          chmod 600 /home/builder/.ssh/aur_key
+          chown builder:builder /home/builder/.ssh/aur_key
+          ssh-keyscan -t ed25519 aur.archlinux.org > /home/builder/.ssh/known_hosts 2>/dev/null || true
+          chown builder:builder /home/builder/.ssh/known_hosts
+          chown -R builder:builder .
+      - name: Update AUR packages (as builder)
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          su builder -s /bin/bash -c "
+            export GIT_SSH_COMMAND='ssh -i /home/builder/.ssh/aur_key -o User=aur -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/builder/.ssh/known_hosts -o IdentitiesOnly=yes'
+            export HOME=/home/builder
+            git config --global user.name 'mizorewww (ci)'
+            git config --global user.email 'mizorewww@users.noreply.github.com'
+            python3 scripts/update-aur.py --version '${TAG#v}' --push
+          "

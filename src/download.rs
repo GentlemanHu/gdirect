@@ -78,6 +78,7 @@ unsafe extern "C" {
         callback: Option<extern "C" fn(i64, i64, i32, i32, *mut std::ffi::c_void) -> i32>,
         data: *mut std::ffi::c_void,
         signals: bool,
+        ifindex: u32,
     ) -> i32;
 }
 
@@ -95,6 +96,7 @@ unsafe fn gdirect_download_ex(
     _callback: Option<extern "C" fn(i64, i64, i32, i32, *mut std::ffi::c_void) -> i32>,
     _data: *mut std::ffi::c_void,
     _signals: bool,
+    _ifindex: u32,
 ) -> i32 {
     eprintln!(
         "Warning: libaria2 was not compiled. Please use the built-in streaming gateway or build libaria2."
@@ -152,6 +154,12 @@ fn download(
     let data = progress.map_or(std::ptr::null_mut(), |p| {
         p as *mut Progress as *mut std::ffi::c_void
     });
+    // A pinned download leaves through the physical interface when bypassing
+    // TUN proxies; the system-network fallback (no IP) follows the proxy.
+    let ifindex = args
+        .ip
+        .and_then(|_| crate::netif::bound())
+        .map_or(0, |interface| interface.index);
     let _lock = SESSION
         .lock()
         .map_err(|_| anyhow::anyhow!("download session lock poisoned"))?;
@@ -172,6 +180,7 @@ fn download(
             },
             data,
             signals,
+            ifindex,
         )
     })
 }
@@ -180,6 +189,7 @@ fn transport(code: i32) -> bool {
     matches!(code, 1 | 2 | 6 | 19)
 }
 fn mark_dead(args: &Args) {
+    crate::netif::forget();
     let (Some(ip), Some(db)) = (args.ip, &args.db) else {
         return;
     };
@@ -374,7 +384,8 @@ fn file_md5(path: &Path) -> Result<String> {
         .map(|b| format!("{b:02x}"))
         .collect())
 }
-fn matches_md5(path: &Path, expected: Option<&str>) -> Result<bool> {
+/// Whether `path` has the given MD5; false when there is none to compare.
+pub fn matches_md5(path: &Path, expected: Option<&str>) -> Result<bool> {
     let Some(expected) = expected else {
         return Ok(false);
     };

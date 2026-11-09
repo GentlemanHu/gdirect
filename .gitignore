@@ -24,3 +24,4 @@ service-logs/
 
 # Promo animation composition & sources (private, not open-sourced)
 docs/onetake-promo/
+/desktop/target/

@@ -66,6 +66,7 @@ export const App: React.FC = () => {
   ]);
   const [files, setFiles] = useState<DriveFile[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<{ message: string; authExpired?: boolean; detail?: string } | null>(null);
 
   // Modals
   const [activePlayerFile, setActivePlayerFile] = useState<DriveFile | null>(null);
@@ -116,11 +117,18 @@ export const App: React.FC = () => {
 
   const loadFiles = useCallback(async (folderId: string) => {
     setFilesLoading(true);
+    setFilesError(null);
     try {
       const list = await fetchDriveFiles(folderId);
       setFiles(list);
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      setFilesError({
+        message: e?.message || '获取文件列表失败',
+        authExpired: e?.authExpired,
+        detail: e?.detail,
+      });
+      setFiles([]);
     } finally {
       setFilesLoading(false);
     }
@@ -473,12 +481,14 @@ export const App: React.FC = () => {
               <Explorer
                 files={files}
                 loading={filesLoading}
+                error={filesError}
                 currentFolder={currentFolder}
                 folderHistory={folderHistory}
                 onNavigateFolder={handleNavigateFolder}
                 onNavigateBreadcrumb={handleNavigateBreadcrumb}
                 onPlayFile={(f) => navigateTo(`/play/${encodeURIComponent(f.id)}`)}
                 onRefresh={() => loadFiles(currentFolder)}
+                onOpenLogin={() => navigateTo('/login')}
               />
             </div>
           </div>
@@ -486,12 +496,14 @@ export const App: React.FC = () => {
           <Explorer
             files={files}
             loading={filesLoading}
+            error={filesError}
             currentFolder={currentFolder}
             folderHistory={folderHistory}
             onNavigateFolder={handleNavigateFolder}
             onNavigateBreadcrumb={handleNavigateBreadcrumb}
             onPlayFile={(f) => navigateTo(`/play/${encodeURIComponent(f.id)}`)}
             onRefresh={() => loadFiles(currentFolder)}
+            onOpenLogin={() => navigateTo('/login')}
           />
         )}
       </main>

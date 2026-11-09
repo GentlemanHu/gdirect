@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import {
+  AlertCircle,
   ChevronRight,
   Code,
   Copy,
@@ -14,6 +15,8 @@ import {
   Image as ImageIcon,
   Info,
   LayoutList,
+  Lock,
+  LogIn,
   Music,
   Play,
   RotateCw,
@@ -27,23 +30,27 @@ import { copyToClipboard as copyUtil } from '../utils/clipboard';
 interface ExplorerProps {
   files: DriveFile[];
   loading: boolean;
+  error?: { message: string; authExpired?: boolean; detail?: string } | null;
   currentFolder: string;
   folderHistory: { id: string; name: string }[];
   onNavigateFolder: (id: string, name: string) => void;
   onNavigateBreadcrumb: (index: number) => void;
   onPlayFile: (file: DriveFile) => void;
   onRefresh: () => void;
+  onOpenLogin?: () => void;
 }
 
 export const Explorer: React.FC<ExplorerProps> = ({
   files,
   loading,
+  error,
   currentFolder,
   folderHistory,
   onNavigateFolder,
   onNavigateBreadcrumb,
   onPlayFile,
   onRefresh,
+  onOpenLogin,
 }) => {
   const [search, setSearch] = useState('');
   const [filterType, setFilterType] = useState<'all' | 'video' | 'audio' | 'image' | 'doc' | 'folder'>('all');
@@ -294,6 +301,57 @@ export const Explorer: React.FC<ExplorerProps> = ({
             <div key={i} className="h-40 rounded-2xl bg-slate-900/60 border border-slate-800"></div>
           ))}
         </div>
+      ) : error ? (
+        error.authExpired ? (
+          <div className="flex flex-col items-center justify-center p-12 sm:p-16 rounded-2xl bg-amber-950/20 border border-amber-500/30 text-center space-y-4">
+            <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-400">
+              <Lock className="w-8 h-8" />
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="text-base sm:text-lg font-bold text-white">Google 账号授权已过期</h3>
+              <p className="text-xs sm:text-sm text-slate-400 max-w-md mx-auto leading-relaxed">
+                Google Cloud 处于「测试 (Testing)」状态的应用刷新令牌限制 7 天有效。当前授权已过期，请重新登录授权或导入凭据。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-3 justify-center pt-1">
+              {onOpenLogin && (
+                <button
+                  onClick={onOpenLogin}
+                  className="px-5 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold transition-all shadow-lg shadow-cyan-500/20 flex items-center space-x-1.5"
+                >
+                  <LogIn className="w-4 h-4" />
+                  <span>重新登录 / 导入授权凭据</span>
+                </button>
+              )}
+              <button
+                onClick={onRefresh}
+                className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-semibold transition-colors flex items-center space-x-1.5"
+              >
+                <RotateCw className="w-3.5 h-3.5" />
+                <span>刷新重试</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center p-12 sm:p-16 rounded-2xl bg-rose-950/20 border border-rose-500/30 text-center space-y-4">
+            <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-400">
+              <AlertCircle className="w-8 h-8" />
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="text-base font-bold text-white">获取文件列表失败</h3>
+              <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+                {error.message}
+              </p>
+            </div>
+            <button
+              onClick={onRefresh}
+              className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-semibold transition-colors flex items-center space-x-1.5"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+              <span>刷新重试</span>
+            </button>
+          </div>
+        )
       ) : filteredFiles.length === 0 ? (
         <div className="flex flex-col items-center justify-center p-16 rounded-2xl glass-panel text-center space-y-3">
           <Folder className="w-12 h-12 text-slate-600" />

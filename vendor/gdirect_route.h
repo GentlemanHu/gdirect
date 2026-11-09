@@ -5,9 +5,13 @@
 extern const char* gdirect_ip;
 // Empty means no override. "" as a set value means "send no SNI"; a hostname
 // means the forged identity: connect and verify as that name while the HTTP
-// Host header carries gdirect_hosthdr, the real Google host.
+// Host header carries the real Google host, which each Request keeps.
 extern const char* gdirect_sni;
-extern std::string gdirect_hosthdr;
+// Index of the physical interface to bind connections to (IP_BOUND_IF on
+// macOS, SO_BINDTOIFINDEX on Linux, IP_UNICAST_IF on Windows), so a TUN proxy
+// cannot capture them; 0 leaves them unbound. Applies only while gdirect_ip
+// pins the endpoint.
+extern unsigned gdirect_ifindex;
 inline bool gdirect_host(const std::string& h) {
   const std::string suffix = ".googleusercontent.com";
   return h == "drive.google.com" || h == "drive.usercontent.google.com" ||

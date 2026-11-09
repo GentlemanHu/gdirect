@@ -1,6 +1,6 @@
 [package]
 name = "gdirect"
-version = "0.9.1"
+version = "0.13.0"
 edition = "2024"
 description = "Browse, transfer and mount Google Drive with native Google authentication"
 license = "GPL-2.0-or-later"
@@ -26,6 +26,7 @@ base64 = "0.22"
 getrandom = "0.3"
 md-5 = "0.11"
 unicode-width = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -40,6 +41,12 @@ chrono = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hex = "0.4"
 jsonwebtoken = "11.1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 cc = "1"

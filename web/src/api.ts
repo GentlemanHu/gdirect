@@ -34,13 +34,27 @@ export async function switchAccount(account: string): Promise<void> {
 
 export async function fetchDriveFiles(folder: string = 'root'): Promise<DriveFile[]> {
   const res = await fetch(`/api/drive/files?folder=${encodeURIComponent(folder)}`, { headers: getHeaders() });
-  if (!res.ok) throw new Error('Failed to list files');
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    const err: any = new Error(data?.error || `获取文件列表失败 (${res.status})`);
+    err.status = res.status;
+    err.authExpired = data?.auth_expired || res.status === 401;
+    err.detail = data?.detail;
+    throw err;
+  }
   return res.json();
 }
 
 export async function searchDriveFiles(query: string): Promise<DriveFile[]> {
   const res = await fetch(`/api/drive/search?q=${encodeURIComponent(query)}`, { headers: getHeaders() });
-  if (!res.ok) throw new Error('Failed to search drive files');
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    const err: any = new Error(data?.error || `搜索文件失败 (${res.status})`);
+    err.status = res.status;
+    err.authExpired = data?.auth_expired || res.status === 401;
+    err.detail = data?.detail;
+    throw err;
+  }
   return res.json();
 }
 

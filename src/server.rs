@@ -712,7 +712,7 @@ fn recover_best_api(state: &AppState) -> Option<Api> {
     let current_account = state.api.read().unwrap().account.clone();
     let google = crate::ranges::current(&db);
     let backups: Vec<crate::api::Endpoint> =
-        scan::usable(db.routes(16).unwrap_or_default(), &google, false)
+        scan::usable(db.routes(16).unwrap_or_default(), &google)
             .into_iter()
             .filter(|r| r.ip != best.ip)
             .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
@@ -752,9 +752,32 @@ async fn api_drive_files(
     let api = state.api_client();
     let folder_clone = folder.clone();
 
-    let files = match tokio::task::spawn_blocking(move || api.list(&folder_clone)).await {
+    let res = tokio::task::spawn_blocking(move || api.list(&folder_clone)).await;
+    let files = match res {
         Ok(Ok(files)) => files,
-        _ => {
+        first_err => {
+            let err_msg = match &first_err {
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+                _ => String::new(),
+            };
+            let is_auth_err = err_msg.contains("expired or revoked")
+                || err_msg.contains("invalid_grant")
+                || err_msg.contains("sign-in error")
+                || err_msg.contains("reauth");
+
+            if is_auth_err {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "Google 账号授权凭据已过期或被撤销，请重新登录授权",
+                        "auth_expired": true,
+                        "detail": err_msg
+                    })),
+                )
+                    .into_response();
+            }
+
             // Self-healing: if current endpoint failed or timed out, auto-failover to best verified route
             if let Some(fallback_api) = recover_best_api(&state) {
                 let fld = folder.clone();
@@ -766,7 +789,10 @@ async fn api_drive_files(
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": "Failed to list files. All direct endpoints failed."})),
+                axum::Json(serde_json::json!({
+                    "error": "Failed to list files. All direct endpoints failed.",
+                    "detail": err_msg
+                })),
             )
                 .into_response();
         }
@@ -791,9 +817,32 @@ async fn api_drive_search(
     let api = state.api_client();
     let q_clone = q.clone();
 
-    let files = match tokio::task::spawn_blocking(move || api.search_files(&q_clone)).await {
+    let res = tokio::task::spawn_blocking(move || api.search_files(&q_clone)).await;
+    let files = match res {
         Ok(Ok(files)) => files,
-        _ => {
+        first_err => {
+            let err_msg = match &first_err {
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+                _ => String::new(),
+            };
+            let is_auth_err = err_msg.contains("expired or revoked")
+                || err_msg.contains("invalid_grant")
+                || err_msg.contains("sign-in error")
+                || err_msg.contains("reauth");
+
+            if is_auth_err {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "Google 账号授权凭据已过期或被撤销，请重新登录授权",
+                        "auth_expired": true,
+                        "detail": err_msg
+                    })),
+                )
+                    .into_response();
+            }
+
             if let Some(fallback_api) = recover_best_api(&state) {
                 let q_str = q.clone();
                 if let Ok(Ok(recovered_files)) =
@@ -804,9 +853,10 @@ async fn api_drive_search(
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(
-                    serde_json::json!({"error": "Search failed. All direct endpoints failed."}),
-                ),
+                axum::Json(serde_json::json!({
+                    "error": "Search failed. All direct endpoints failed.",
+                    "detail": err_msg
+                })),
             )
                 .into_response();
         }
@@ -926,7 +976,7 @@ async fn api_trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
     let db_path = state.db_path.clone();
     tokio::task::spawn_blocking(move || {
         if let Ok(db) = Store::open(&db_path) {
-            let _ = scan::run(&db, None, false);
+            let _ = scan::run(&db, None);
         }
     });
 
@@ -975,7 +1025,7 @@ async fn api_switch_route(
         let current_account = lock.account.clone();
         let backups = if let Ok(db) = Store::open(&state.db_path) {
             let google = crate::ranges::current(&db);
-            scan::usable(db.routes(16).unwrap_or_default(), &google, false)
+            scan::usable(db.routes(16).unwrap_or_default(), &google)
                 .into_iter()
                 .filter(|r| Some(r.ip) != ip)
                 .map(|r| (r.ip, (!r.sni.is_empty()).then_some(r.sni)))
@@ -1303,9 +1353,9 @@ pub fn run_serve(cfg: ServeConfig) -> anyhow::Result<()> {
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(db) = Store::open(&bg_db_path) {
                 let google = crate::ranges::current(&db);
-                let routes = scan::usable(db.routes(8).unwrap_or_default(), &google, false);
+                let routes = scan::usable(db.routes(8).unwrap_or_default(), &google);
                 if routes.is_empty() {
-                    let _ = scan::run(&db, None, false);
+                    let _ = scan::run(&db, None);
                 }
                 if let Some(recovered) = recover_best_api(&bg_state) {
                     if let Ok(mut lock) = bg_state.api.write() {

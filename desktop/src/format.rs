@@ -1,0 +1,388 @@
+//! How sizes, times and file kinds read in the client.
+use crate::tf;
+use chrono::{DateTime, Datelike, Local};
+use gdirect::api::File;
+
+pub fn bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if n < 1000 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64;
+    let mut unit = "B";
+    for next in UNITS {
+        if value < 1000. {
+            break;
+        }
+        value /= 1000.;
+        unit = next;
+    }
+    if value < 10. {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+pub fn speed(n: u64) -> String {
+    format!("{}/s", bytes(n))
+}
+
+pub fn duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => tf!("{seconds} 秒", "{seconds}s"),
+        60..3600 => {
+            let (m, s) = (seconds / 60, seconds % 60);
+            tf!("{m} 分 {s} 秒", "{m}m {s}s")
+        }
+        _ => {
+            let (h, m) = (seconds / 3600, seconds % 3600 / 60);
+            tf!("{h} 小时 {m} 分", "{h}h {m}m")
+        }
+    }
+}
+
+/// Drive's RFC 3339 time as the file list shows it: a time today, a date
+/// this year, a full date before that.
+pub fn modified(time: Option<&str>) -> String {
+    let Some(time) = time.and_then(|t| DateTime::parse_from_rfc3339(t).ok()) else {
+        return "—".into();
+    };
+    let time = time.with_timezone(&Local);
+    let now = Local::now();
+    let (year, month, day) = (time.year(), time.month(), time.day());
+    let mon = time.format("%b");
+    if time.date_naive() == now.date_naive() {
+        clock(time)
+    } else if year == now.year() {
+        tf!("{month}月{day}日", "{mon} {day}")
+    } else {
+        tf!("{year}年{month}月{day}日", "{mon} {day}, {year}")
+    }
+}
+
+/// A moment of this session, for the finished-transfer list.
+pub fn clock(time: DateTime<Local>) -> String {
+    let hm = time.format("%H:%M");
+    tf!("今天 {hm}", "Today {hm}")
+}
+
+pub fn size(file: &File) -> String {
+    match file.size.as_deref().and_then(|s| s.parse().ok()) {
+        Some(n) if !file.folder() => bytes(n),
+        _ => "—".into(),
+    }
+}
+
+/// A file's kind: its icon and the tonal pair its tile is painted with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Folder,
+    Pdf,
+    Sheet,
+    Image,
+    Video,
+    Audio,
+    Doc,
+    GoogleDoc,
+    Archive,
+    Other,
+}
+
+impl Kind {
+    /// A shortcut takes its target's kind.
+    pub fn of(file: &File) -> Self {
+        let mime = file
+            .shortcut_details
+            .as_ref()
+            .and_then(|d| d.target_mime_type.as_deref())
+            .filter(|_| file.mime_type == crate::places::SHORTCUT)
+            .unwrap_or(&file.mime_type);
+        Self::from_mime(mime, &file.name)
+    }
+
+    pub fn from_mime(mime: &str, name: &str) -> Self {
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if mime == "application/vnd.google-apps.folder" {
+            Self::Folder
+        } else if mime.starts_with("application/vnd.google-apps.") {
+            Self::GoogleDoc
+        } else if mime == "application/pdf" || ext == "pdf" {
+            Self::Pdf
+        // Drive often stores a generic MIME type; the extension decides then.
+        } else if mime.starts_with("image/")
+            || matches!(
+                ext.as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "heic"
+                    | "heif"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "svg"
+            )
+        {
+            Self::Image
+        } else if mime.starts_with("video/")
+            || matches!(
+                ext.as_str(),
+                "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" | "wmv"
+            )
+        {
+            Self::Video
+        } else if mime.starts_with("audio/")
+            || matches!(
+                ext.as_str(),
+                "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "opus" | "aiff"
+            )
+        {
+            Self::Audio
+        } else if mime.contains("spreadsheet") || matches!(ext.as_str(), "xlsx" | "xls" | "csv") {
+            Self::Sheet
+        } else if mime.contains("word")
+            || mime.starts_with("text/")
+            || matches!(
+                ext.as_str(),
+                "doc" | "docx" | "txt" | "md" | "rtf" | "pages"
+            )
+        {
+            Self::Doc
+        } else if matches!(ext.as_str(), "zip" | "7z" | "rar" | "gz" | "tar" | "dmg") {
+            Self::Archive
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn from_path(path: &std::path::Path) -> Self {
+        if path.is_dir() {
+            return Self::Folder;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "svg" => "image/",
+            "mp4" | "mov" | "mkv" | "avi" | "webm" => "video/",
+            "mp3" | "m4a" | "wav" | "flac" | "aac" => "audio/",
+            _ => "",
+        };
+        Self::from_mime(mime, &name)
+    }
+
+    /// The Material Symbol's name.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Folder => "folder",
+            Self::Pdf => "picture_as_pdf",
+            Self::Sheet => "table_chart",
+            Self::Image => "image",
+            Self::Video => "movie",
+            Self::Audio => "graphic_eq",
+            Self::Doc => "description",
+            Self::GoogleDoc => "article",
+            Self::Archive => "folder_zip",
+            Self::Other => "draft",
+        }
+    }
+}
+
+/// The export a Google document is downloaded as: MIME type and extension.
+pub fn export(file: &File, office: bool) -> Option<(&'static str, &'static str)> {
+    let kind = file
+        .mime_type
+        .strip_prefix("application/vnd.google-apps.")?;
+    Some(match (kind, office) {
+        ("document", true) => (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx",
+        ),
+        ("spreadsheet", true) => (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        ),
+        ("presentation", true) => (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "pptx",
+        ),
+        _ => ("application/pdf", "pdf"),
+    })
+}
+
+/// A path under the home directory, written with `~`.
+pub fn home(path: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(|p| p.to_owned())) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// A route's health by its latency, as the Routes page grades it: green
+/// under 300 ms, amber under a second, red beyond; green when unmeasured.
+pub fn latency_role(ms: Option<i64>) -> gpui_kit_material::prelude::ColorRole {
+    use gpui_kit_material::prelude::ColorRole;
+    match ms {
+        Some(ms) if ms >= 1000 => ColorRole::ERROR,
+        Some(ms) if ms >= 300 => ColorRole::WARNING,
+        _ => ColorRole::SUCCESS,
+    }
+}
+
+/// Names in the order people expect: case aside, and runs of digits by their
+/// value, so "Photo 2" comes before "Photo 10".
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let run = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut digits = String::new();
+                    while let Some(c) = chars.peek().copied().filter(char::is_ascii_digit) {
+                        digits.push(c);
+                        chars.next();
+                    }
+                    digits
+                };
+                let (x, y) = (run(&mut a), run(&mut b));
+                let (tx, ty) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                let order = tx.len().cmp(&ty.len()).then_with(|| tx.cmp(ty));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let order = x.to_lowercase().cmp(y.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_sort_naturally() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("Photo 2", "photo 10"), Less);
+        assert_eq!(natural_cmp("a10b", "a9c"), Greater);
+        assert_eq!(natural_cmp("File", "file"), Equal);
+        assert_eq!(natural_cmp("x007", "x7"), Equal);
+        assert_eq!(natural_cmp("第2章", "第10章"), Less);
+        assert_eq!(
+            latency_role(Some(299)),
+            gpui_kit_material::prelude::ColorRole::SUCCESS
+        );
+        assert_eq!(
+            latency_role(Some(300)),
+            gpui_kit_material::prelude::ColorRole::WARNING
+        );
+        assert_eq!(
+            latency_role(Some(1000)),
+            gpui_kit_material::prelude::ColorRole::ERROR
+        );
+    }
+
+    #[test]
+    fn kinds_fall_back_to_the_extension() {
+        assert_eq!(
+            Kind::from_mime("application/octet-stream", "主题曲.flac"),
+            Kind::Audio
+        );
+        assert_eq!(
+            Kind::from_mime("application/octet-stream", "a.MOV"),
+            Kind::Video
+        );
+        assert_eq!(
+            Kind::from_mime("application/octet-stream", "b.heic"),
+            Kind::Image
+        );
+        assert_eq!(
+            Kind::from_mime("application/octet-stream", "c.bin"),
+            Kind::Other
+        );
+    }
+
+    #[test]
+    fn sizes_read_in_decimal_units() {
+        assert_eq!(bytes(999), "999 B");
+        assert_eq!(bytes(4_200_000), "4.2 MB");
+        assert_eq!(bytes(12_800_000), "13 MB");
+        assert_eq!(bytes(1_400_000_000), "1.4 GB");
+    }
+
+    #[test]
+    fn kinds_follow_mime_then_extension() {
+        assert_eq!(Kind::from_mime("application/pdf", "a"), Kind::Pdf);
+        assert_eq!(
+            Kind::from_mime("application/octet-stream", "a.XLSX"),
+            Kind::Sheet
+        );
+        assert_eq!(
+            Kind::from_mime("application/vnd.google-apps.folder", "x"),
+            Kind::Folder
+        );
+        assert_eq!(Kind::from_mime("video/mp4", "x"), Kind::Video);
+    }
+
+    /// Both languages in one test: the language is a process-wide global.
+    #[test]
+    fn times_read_in_either_language() {
+        use crate::i18n::{Language, apply};
+        use chrono::TimeZone;
+        let at = |y, mo, d, h, mi| {
+            Local
+                .with_ymd_and_hms(y, mo, d, h, mi, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let now = Local::now();
+        let today = at(now.year(), now.month(), now.day(), 15, 53);
+        // A day this year that isn't today.
+        let (mo, d) = if (now.month(), now.day()) == (11, 5) {
+            (11, 6)
+        } else {
+            (11, 5)
+        };
+        let this_year = at(now.year(), mo, d, 12, 0);
+        let past = at(2020, 11, 5, 12, 0);
+
+        let _language = crate::i18n::LANGUAGE_LOCK.lock().unwrap();
+        apply(Language::Chinese);
+        assert_eq!(duration(42), "42 秒");
+        assert_eq!(duration(125), "2 分 5 秒");
+        assert_eq!(duration(3_720), "1 小时 2 分");
+        assert_eq!(modified(Some(&today)), "今天 15:53");
+        assert_eq!(modified(Some(&this_year)), format!("11月{d}日"));
+        assert_eq!(modified(Some(&past)), "2020年11月5日");
+        assert_eq!(modified(None), "—");
+
+        apply(Language::English);
+        assert_eq!(duration(42), "42s");
+        assert_eq!(duration(125), "2m 5s");
+        assert_eq!(duration(3_720), "1h 2m");
+        assert_eq!(modified(Some(&today)), "Today 15:53");
+        assert_eq!(modified(Some(&this_year)), format!("Nov {d}"));
+        assert_eq!(modified(Some(&past)), "Nov 5, 2020");
+        assert_eq!(modified(None), "—");
+    }
+}
