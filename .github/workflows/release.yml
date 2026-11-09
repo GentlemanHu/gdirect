@@ -258,14 +258,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  desktop:
-    uses: ./.github/workflows/desktop.yml
-    with:
-      ref: ${{ inputs.tag || github.ref }}
-
   publish:
     name: Publish complete release
-    needs: [unix, windows, android, desktop]
+    needs: [unix, windows, android]
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
     runs-on: ubuntu-22.04
     permissions:
@@ -301,10 +296,6 @@ jobs:
               ext = 'zip' if 'windows' in target else 'tar.gz'
               assert pathlib.Path(f'dist/gdirect-{version}-{target}.{ext}').is_file(), f'Missing full asset for {target}'
               assert pathlib.Path(f'dist/gdirect-cli-{version}-{target}.{ext}').is_file(), f'Missing cli asset for {target}'
-          for name in ['macos-arm64.zip', 'macos-x64.zip', 'linux-x64.tar.gz', 'windows-x64.msi']:
-              p = pathlib.Path(f'dist/gdirect-desktop-{name}')
-              if p.is_file():
-                  print(f'Desktop asset {name} present')
           PY
           cd dist
           cat ./*.sha256 | tr -d '\r' > SHA256SUMS
