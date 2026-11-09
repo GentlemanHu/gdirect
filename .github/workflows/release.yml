@@ -208,7 +208,6 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-<<<<<<< HEAD
   android:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-22.04
