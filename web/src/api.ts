@@ -116,6 +116,51 @@ export async function switchRoute(ip: string, sni?: string | null): Promise<void
   }
 }
 
+export interface OAuthStatusResponse {
+  has_client: boolean;
+  client_id?: string | null;
+  current_account?: string | null;
+}
+
+export async function fetchOAuthStatus(): Promise<OAuthStatusResponse> {
+  const res = await fetch('/api/auth/oauth-status', { headers: getHeaders() });
+  if (!res.ok) throw new Error('Failed to fetch OAuth status');
+  return res.json();
+}
+
+export async function startOAuthLogin(params?: {
+  client_id?: string;
+  client_secret?: string;
+  redirect_uri?: string;
+}): Promise<{
+  auth_url: string;
+  state: string;
+  redirect_uri: string;
+}> {
+  const res = await fetch('/api/auth/start-login', {
+    method: 'POST',
+    headers: { ...getHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(params || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to start OAuth login');
+  return data;
+}
+
+export async function exchangeOAuthCode(
+  codeOrUrl: string,
+  state?: string,
+): Promise<{ success: boolean; account: string; message: string }> {
+  const res = await fetch('/api/auth/exchange-code', {
+    method: 'POST',
+    headers: { ...getHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code_or_url: codeOrUrl, state }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to exchange OAuth code');
+  return data;
+}
+
 export async function importAuth(credentialsJson: string): Promise<{ success: boolean; account?: string; message?: string }> {
   const res = await fetch('/api/auth/import', {
     method: 'POST',

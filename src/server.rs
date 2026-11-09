@@ -8,7 +8,12 @@ use axum::{
 #[cfg(feature = "web")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
@@ -30,12 +35,21 @@ use crate::{
 struct Assets;
 
 #[derive(Clone)]
+pub struct PendingOAuthSession {
+    pub client: crate::auth::Client,
+    pub verifier: String,
+    pub redirect_uri: String,
+    pub created_at: Instant,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub api: Arc<std::sync::RwLock<Api>>,
     pub engine: StreamEngine,
     pub webdav: WebDavTree,
     pub db_path: PathBuf,
     pub start_time: Instant,
+    pub pending_oauth: Arc<std::sync::Mutex<HashMap<String, PendingOAuthSession>>>,
 }
 
 impl AppState {
@@ -83,6 +97,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/accounts", get(api_accounts))
         .route("/api/accounts/switch", post(api_switch_account))
         .route("/api/auth/import", post(api_auth_import))
+        .route("/api/auth/oauth-status", get(api_oauth_status))
+        .route("/api/auth/start-login", post(api_start_login))
+        .route("/api/auth/callback", get(api_oauth_callback))
+        .route("/api/auth/exchange-code", post(api_exchange_code))
+        .route("/callback", get(api_oauth_callback))
         .route("/api/drive/files", get(api_drive_files))
         .route("/api/drive/search", get(api_drive_search))
         .route("/api/drive/file/{id}", get(api_drive_file))
@@ -654,25 +673,25 @@ async fn api_auth_import(
             .into_response();
     }
 
-    // Case 2: client_secret.json (installed app)
-    if val.get("installed").is_some() {
-        let client_val = &val["installed"];
-        let client_id = client_val
-            .get("client_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !client_id.is_empty() {
-            let _ = db.set(
-                "oauth_client",
-                &serde_json::to_string(&client_val).unwrap_or_default(),
-            );
+    // Case 2: client_secret.json (installed / web / flat)
+    let client_obj = val
+        .get("installed")
+        .or_else(|| val.get("web"))
+        .unwrap_or(&val);
+    if let (Some(cid), Some(sec)) = (
+        client_obj.get("client_id").and_then(|v| v.as_str()),
+        client_obj.get("client_secret").and_then(|v| v.as_str()),
+    ) {
+        if !cid.is_empty() && !sec.is_empty() {
+            let client = crate::auth::Client::new(cid, sec);
+            let _ = crate::auth::save_client(&db, &client);
             return (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
                     "success": true,
                     "type": "oauth_client",
-                    "client_id": client_id,
-                    "message": "OAuth Client 凭据已成功保存！"
+                    "client_id": cid,
+                    "message": "OAuth Client 凭据已成功保存！可直接点击「一键跳转 Google 授权」完成登录"
                 })),
             )
                 .into_response();
@@ -701,6 +720,422 @@ async fn api_auth_import(
         StatusCode::BAD_REQUEST,
         axum::Json(serde_json::json!({
             "error": "未识别的凭据格式。请粘贴包含 \"type\": \"authorized_user\" 的凭据 JSON，或 client_secret.json 内容。"
+        })),
+    )
+        .into_response()
+}
+
+// --- Interactive Google OAuth Flow Handlers ---
+
+async fn api_oauth_status(State(state): State<AppState>) -> impl IntoResponse {
+    let db = match Store::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let client = crate::auth::saved_client(&db, None).ok().flatten();
+    let current_account = state.api.read().unwrap().account.clone();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "has_client": client.is_some(),
+            "client_id": client.as_ref().map(|c| c.client_id.clone()),
+            "current_account": current_account,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct StartLoginReq {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+}
+
+async fn api_start_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<StartLoginReq>,
+) -> impl IntoResponse {
+    let db = match Store::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let client = if let (Some(id), Some(secret)) = (
+        req.client_id.filter(|s| !s.trim().is_empty()),
+        req.client_secret.filter(|s| !s.trim().is_empty()),
+    ) {
+        let c = crate::auth::Client::new(&id, &secret);
+        if let Err(e) = c.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+        let _ = crate::auth::save_client(&db, &c);
+        c
+    } else if let Some(saved) = crate::auth::saved_client(&db, None).ok().flatten() {
+        saved
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "未检测到 OAuth Client 配置，请先提供 Client ID 和 Client Secret（或粘贴 client_secret.json）"
+            })),
+        )
+            .into_response();
+    };
+
+    let state_str = match crate::auth::random_string() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let verifier = match crate::auth::random_string() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let redirect_uri = req.redirect_uri.unwrap_or_else(|| {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost:8080");
+        format!("http://{host}/callback")
+    });
+
+    let auth_url = match crate::auth::build_auth_url(&client, &redirect_uri, &state_str, &verifier)
+    {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Ok(mut pending) = state.pending_oauth.lock() {
+        let cutoff = Instant::now() - Duration::from_secs(900);
+        pending.retain(|_, v| v.created_at > cutoff);
+        pending.insert(
+            state_str.clone(),
+            PendingOAuthSession {
+                client,
+                verifier,
+                redirect_uri: redirect_uri.clone(),
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "success": true,
+            "auth_url": auth_url.to_string(),
+            "state": state_str,
+            "redirect_uri": redirect_uri,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct OAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn api_oauth_callback(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Response {
+    if let Some(err) = query.error {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!(
+                r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">Google 授权已取消或拒绝</h2><p style="color:#94a3b8;">错误详情: {}</p><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回控制台</a></div></body></html>"#,
+                err
+            ),
+        )
+            .into_response();
+    }
+
+    let code = match query.code {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">缺少授权 code</h2><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回重新授权</a></div></body></html>"#,
+            )
+                .into_response();
+        }
+    };
+
+    let session = query
+        .state
+        .as_deref()
+        .and_then(|st| state.pending_oauth.lock().ok()?.remove(st))
+        .or_else(|| {
+            state.pending_oauth.lock().ok().and_then(|mut m| {
+                if m.len() == 1 {
+                    let key = m.keys().next().cloned()?;
+                    m.remove(&key)
+                } else {
+                    None
+                }
+            })
+        });
+
+    let (client, verifier, redirect_uri) = match session {
+        Some(s) => (s.client, s.verifier, s.redirect_uri),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">授权会话已失效或过期</h2><p style="color:#94a3b8;">请回到管理控制台重新发起授权。</p><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回重新授权</a></div></body></html>"#,
+            )
+                .into_response();
+        }
+    };
+
+    let creds = match crate::auth::exchange_auth_code(&client, &code, &verifier, &redirect_uri) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!(
+                    r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">换取令牌失败</h2><p style="color:#94a3b8;">{}</p><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回重新授权</a></div></body></html>"#,
+                    e
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let token_res = match crate::auth::refresh(&creds) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!(
+                    r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">刷新凭据失败</h2><p style="color:#94a3b8;">{}</p></div></body></html>"#,
+                    e
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let email = match state
+        .api_client()
+        .account_for_token_ext(&token_res.access_token)
+    {
+        Ok(em) => em,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!(
+                    r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">识别账号身份失败</h2><p style="color:#94a3b8;">{}</p></div></body></html>"#,
+                    e
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    if let Ok(db) = Store::open(&state.db_path) {
+        let _ = db.save_account(&email, &serde_json::to_string(&creds).unwrap_or_default());
+        let _ = db.save_token(&email, &token_res.access_token, token_res.expires_in);
+        let _ = db.set_default_account(&email);
+    }
+
+    if let Ok(mut lock) = state.api.write() {
+        lock.account = Some(email.clone());
+    }
+    if let Some(recovered) = recover_best_api(&state) {
+        if let Ok(mut lock) = state.api.write() {
+            *lock = recovered;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        format!(
+            r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:32px;border:1px solid #1e293b;border-radius:20px;background:#0f172a;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);"><div style="font-size:36px;margin-bottom:12px;">🎉</div><h2 style="color:#22d3ee;margin:0 0 8px;font-size:20px;">Google 账号授权成功！</h2><p style="color:#94a3b8;margin:0 0 16px;">已成功绑定账号：<strong style="color:#f8fafc;">{}</strong></p><p style="color:#64748b;font-size:13px;">正在返回管理控制台...</p><script>setTimeout(function(){{ window.location.href = '/#explorer'; }}, 1200);</script></div></body></html>"#,
+            email
+        ),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ExchangeCodeReq {
+    code_or_url: String,
+    state: Option<String>,
+}
+
+async fn api_exchange_code(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<ExchangeCodeReq>,
+) -> impl IntoResponse {
+    let raw = req.code_or_url.trim();
+    let (code, state_str) = if raw.starts_with("http") {
+        if let Ok(url) = url::Url::parse(raw) {
+            let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            let c = q.get("code").cloned().unwrap_or_default();
+            let s = q.get("state").cloned();
+            (c, s)
+        } else {
+            (raw.to_string(), req.state.clone())
+        }
+    } else {
+        (raw.to_string(), req.state.clone())
+    };
+
+    if code.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "未能提取到有效的授权 code"})),
+        )
+            .into_response();
+    }
+
+    let session = state_str
+        .as_deref()
+        .and_then(|st| state.pending_oauth.lock().ok()?.remove(st))
+        .or_else(|| {
+            state.pending_oauth.lock().ok().and_then(|mut m| {
+                if m.len() == 1 {
+                    let key = m.keys().next().cloned()?;
+                    m.remove(&key)
+                } else {
+                    None
+                }
+            })
+        });
+
+    let db = match Store::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let (client, verifier, redirect_uri) = match session {
+        Some(s) => (s.client, s.verifier, s.redirect_uri),
+        None => {
+            let client = match crate::auth::saved_client(&db, None).ok().flatten() {
+                Some(c) => c,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "未找到对应的 OAuth Client 配置"})),
+                    )
+                        .into_response();
+                }
+            };
+            (
+                client,
+                String::new(),
+                "http://127.0.0.1:8080/callback".to_string(),
+            )
+        }
+    };
+
+    let creds = match crate::auth::exchange_auth_code(&client, &code, &verifier, &redirect_uri) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": format!("换取令牌失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let token_res = match crate::auth::refresh(&creds) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": format!("刷新令牌失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let email = match state
+        .api_client()
+        .account_for_token_ext(&token_res.access_token)
+    {
+        Ok(em) => em,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": format!("获取账号邮箱失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let _ = db.save_account(&email, &serde_json::to_string(&creds).unwrap_or_default());
+    let _ = db.save_token(&email, &token_res.access_token, token_res.expires_in);
+    let _ = db.set_default_account(&email);
+
+    if let Ok(mut lock) = state.api.write() {
+        lock.account = Some(email.clone());
+    }
+    if let Some(recovered) = recover_best_api(&state) {
+        if let Ok(mut lock) = state.api.write() {
+            *lock = recovered;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "success": true,
+            "account": email,
+            "message": format!("成功授权并绑定账号: {email}")
         })),
     )
         .into_response()
@@ -1288,6 +1723,7 @@ pub fn run_serve(cfg: ServeConfig) -> anyhow::Result<()> {
     let engine = StreamEngine::new(async_client, stream_config);
     let api_rwlock = Arc::new(std::sync::RwLock::new(api));
     let webdav = WebDavTree::new(api_rwlock.clone());
+    let pending_oauth = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let state = AppState {
         api: api_rwlock,
@@ -1295,6 +1731,7 @@ pub fn run_serve(cfg: ServeConfig) -> anyhow::Result<()> {
         webdav,
         db_path: cfg.db_path.clone(),
         start_time: std::time::Instant::now(),
+        pending_oauth,
     };
 
     let router = create_router(state.clone());

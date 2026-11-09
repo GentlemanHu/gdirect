@@ -384,7 +384,7 @@ pub fn client(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn unix_addresses(name: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
     let (mut v4, mut v6) = (None, None);
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -421,6 +421,58 @@ fn unix_addresses(name: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
         libc::freeifaddrs(list);
     }
     (v4, v6)
+}
+
+#[cfg(target_os = "android")]
+fn unix_addresses(name: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    type GetIfAddrsFn = unsafe extern "C" fn(*mut *mut libc::ifaddrs) -> libc::c_int;
+    type FreeIfAddrsFn = unsafe extern "C" fn(*mut libc::ifaddrs);
+
+    unsafe {
+        let getifaddrs_ptr = libc::dlsym(libc::RTLD_DEFAULT, b"getifaddrs\0".as_ptr() as *const _);
+        let freeifaddrs_ptr =
+            libc::dlsym(libc::RTLD_DEFAULT, b"freeifaddrs\0".as_ptr() as *const _);
+
+        if getifaddrs_ptr.is_null() || freeifaddrs_ptr.is_null() {
+            return (None, None);
+        }
+
+        let getifaddrs: GetIfAddrsFn = std::mem::transmute(getifaddrs_ptr);
+        let freeifaddrs: FreeIfAddrsFn = std::mem::transmute(freeifaddrs_ptr);
+
+        let (mut v4, mut v6) = (None, None);
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if getifaddrs(&mut list) != 0 {
+            return (None, None);
+        }
+        let mut entry = list;
+        while !entry.is_null() {
+            let ifa = &*entry;
+            entry = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || std::ffi::CStr::from_ptr(ifa.ifa_name).to_bytes() != name.as_bytes()
+            {
+                continue;
+            }
+            match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET if v4.is_none() => {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    v4 = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+                }
+                libc::AF_INET6 => {
+                    let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                    let global = !ip.is_unicast_link_local() && !ip.is_loopback();
+                    if global && v6.is_none() {
+                        v6 = Some(ip);
+                    }
+                }
+                _ => {}
+            }
+        }
+        freeifaddrs(list);
+        (v4, v6)
+    }
 }
 #[cfg(target_vendor = "apple")]
 fn index_name(index: u32) -> Option<String> {

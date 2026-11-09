@@ -373,14 +373,69 @@ pub fn prepare_login(
     }
     credentials(db, account)
 }
-fn random_string() -> Result<String> {
+pub fn random_string() -> Result<String> {
     let mut bytes = [0; 32];
     getrandom::fill(&mut bytes)
         .map_err(|_| anyhow::anyhow!("system random generator unavailable"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
-fn challenge(verifier: &str) -> String {
+pub fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+pub fn build_auth_url(
+    client: &Client,
+    redirect_uri: &str,
+    state: &str,
+    verifier: &str,
+) -> Result<url::Url> {
+    client.validate()?;
+    let mut url = url::Url::parse(AUTH_URI)?;
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", client.client_id.as_str()),
+        ("redirect_uri", redirect_uri),
+        ("response_type", "code"),
+        ("scope", SCOPE),
+        ("access_type", "offline"),
+        ("prompt", "consent select_account"),
+        ("state", state),
+        ("code_challenge", challenge(verifier).as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
+    Ok(url)
+}
+
+pub fn exchange_auth_code(
+    client: &Client,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<Credentials> {
+    let (status, token) = post_token(
+        TOKEN_URI,
+        &[
+            ("client_id", client.client_id.as_str()),
+            ("client_secret", client.client_secret.as_str()),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ],
+    )?;
+    ensure!(
+        status.is_success(),
+        "Google rejected the authorization code ({}). Please check OAuth client configuration.",
+        google_error(status, &token)
+    );
+    let refresh_token = token["refresh_token"]
+        .as_str()
+        .context("token response did not include a refresh token")?
+        .to_owned();
+    Ok(Credentials {
+        client_id: client.client_id.clone(),
+        client_secret: client.client_secret.clone(),
+        refresh_token,
+    })
 }
 fn callback(target: &str, state: &str) -> Result<Option<String>> {
     ensure!(target.starts_with("/callback?"), "unexpected callback path");
