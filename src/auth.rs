@@ -17,7 +17,8 @@ use std::{
 pub const CONFIG_GUIDE: &str =
     "https://github.com/mizorewww/gdirect/blob/main/docs/configuration/README.md";
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
-const SCOPE: &str = "https://www.googleapis.com/auth/drive";
+const SCOPE: &str =
+    "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email openid";
 
 // Only these fields are kept, so an imported token_uri or credential source is ignored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -405,12 +406,33 @@ pub fn build_auth_url(
     Ok(url)
 }
 
+pub fn extract_email_from_id_token(id_token: &str) -> Option<String> {
+    use base64::Engine;
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() >= 2 {
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let bytes = engine
+            .decode(parts[1])
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(parts[1]))
+            .ok()?;
+        let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if let Some(email) = val
+            .get("email")
+            .and_then(|v| v.as_str())
+            .filter(|e| !e.is_empty())
+        {
+            return Some(email.to_string());
+        }
+    }
+    None
+}
+
 pub fn exchange_auth_code(
     client: &Client,
     code: &str,
     verifier: &str,
     redirect_uri: &str,
-) -> Result<Credentials> {
+) -> Result<(Credentials, Option<String>)> {
     let (status, token) = post_token(
         TOKEN_URI,
         &[
@@ -431,11 +453,18 @@ pub fn exchange_auth_code(
         .as_str()
         .context("token response did not include a refresh token")?
         .to_owned();
-    Ok(Credentials {
-        client_id: client.client_id.clone(),
-        client_secret: client.client_secret.clone(),
-        refresh_token,
-    })
+    let email = token
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .and_then(extract_email_from_id_token);
+    Ok((
+        Credentials {
+            client_id: client.client_id.clone(),
+            client_secret: client.client_secret.clone(),
+            refresh_token,
+        },
+        email,
+    ))
 }
 fn callback(target: &str, state: &str) -> Result<Option<String>> {
     ensure!(target.starts_with("/callback?"), "unexpected callback path");

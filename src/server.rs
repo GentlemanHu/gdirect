@@ -592,12 +592,16 @@ async fn api_auth_import(
             .account_for_token_ext(&token_res.access_token)
         {
             Ok(em) => em,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({"error": format!("Cannot verify account identity: {e}")})),
-                )
-                    .into_response();
+            Err(_) => {
+                if let Ok(Some(def)) = db.default_account() {
+                    def
+                } else if let Ok(accs) = db.accounts() {
+                    accs.into_iter()
+                        .next()
+                        .unwrap_or_else(|| "default".to_string())
+                } else {
+                    "default".to_string()
+                }
             }
         };
 
@@ -929,18 +933,23 @@ async fn api_oauth_callback(
         }
     };
 
-    let creds = match crate::auth::exchange_auth_code(&client, &code, &verifier, &redirect_uri) {
+    let (creds, email_opt) = match crate::auth::exchange_auth_code(
+        &client,
+        &code,
+        &verifier,
+        &redirect_uri,
+    ) {
         Ok(c) => c,
         Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                format!(
-                    r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">换取令牌失败</h2><p style="color:#94a3b8;">{}</p><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回重新授权</a></div></body></html>"#,
-                    e
-                ),
-            )
-                .into_response();
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    format!(
+                        r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">换取令牌失败</h2><p style="color:#94a3b8;">{}</p><a href="/#login" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#1e293b;color:#38bdf8;border-radius:8px;text-decoration:none;">返回重新授权</a></div></body></html>"#,
+                        e
+                    ),
+                )
+                    .into_response();
         }
     };
 
@@ -959,22 +968,25 @@ async fn api_oauth_callback(
         }
     };
 
-    let email = match state
+    let email = if let Some(em) = email_opt {
+        em
+    } else if let Ok(em) = state
         .api_client()
         .account_for_token_ext(&token_res.access_token)
     {
-        Ok(em) => em,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                format!(
-                    r#"<!DOCTYPE html><html><body style="background:#020617;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;padding:24px;border:1px solid #dc2626;border-radius:16px;background:#0f172a;"><h2 style="color:#ef4444;">识别账号身份失败</h2><p style="color:#94a3b8;">{}</p></div></body></html>"#,
-                    e
-                ),
-            )
-                .into_response();
+        em
+    } else if let Ok(db) = Store::open(&state.db_path) {
+        if let Ok(Some(def)) = db.default_account() {
+            def
+        } else if let Ok(accs) = db.accounts() {
+            accs.into_iter()
+                .next()
+                .unwrap_or_else(|| "default".to_string())
+        } else {
+            "default".to_string()
         }
+    } else {
+        "default".to_string()
     };
 
     if let Ok(db) = Store::open(&state.db_path) {
@@ -1081,16 +1093,17 @@ async fn api_exchange_code(
         }
     };
 
-    let creds = match crate::auth::exchange_auth_code(&client, &code, &verifier, &redirect_uri) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": format!("换取令牌失败: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    let (creds, email_opt) =
+        match crate::auth::exchange_auth_code(&client, &code, &verifier, &redirect_uri) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": format!("换取令牌失败: {e}")})),
+                )
+                    .into_response();
+            }
+        };
 
     let token_res = match crate::auth::refresh(&creds) {
         Ok(t) => t,
@@ -1103,18 +1116,21 @@ async fn api_exchange_code(
         }
     };
 
-    let email = match state
+    let email = if let Some(em) = email_opt {
+        em
+    } else if let Ok(em) = state
         .api_client()
         .account_for_token_ext(&token_res.access_token)
     {
-        Ok(em) => em,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": format!("获取账号邮箱失败: {e}")})),
-            )
-                .into_response();
-        }
+        em
+    } else if let Ok(Some(def)) = db.default_account() {
+        def
+    } else if let Ok(accs) = db.accounts() {
+        accs.into_iter()
+            .next()
+            .unwrap_or_else(|| "default".to_string())
+    } else {
+        "default".to_string()
     };
 
     let _ = db.save_account(&email, &serde_json::to_string(&creds).unwrap_or_default());

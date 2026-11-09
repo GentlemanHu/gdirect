@@ -262,16 +262,75 @@ impl ApiExt for crate::api::Api {
     }
 
     fn account_for_token_ext(&self, token: &str) -> Result<String> {
-        let response = self.deliver(|client, forged| {
+        // 1. Try Drive API about endpoint via direct Google IP endpoint
+        if let Ok(response) = self.deliver(|client, forged| {
             client
                 .get(crate::api::url_for(forged, "drive/v3/about"))
                 .query(&[("fields", "user(emailAddress)")])
                 .bearer_auth(token)
-        })?;
-        let data: serde_json::Value = response.json()?;
-        let email = data["user"]["emailAddress"]
-            .as_str()
-            .context("Google returned invalid user info")?;
-        Ok(email.to_string())
+        }) {
+            if let Ok(text) = response.text() {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(email) = data["user"]["emailAddress"]
+                        .as_str()
+                        .filter(|e| !e.is_empty())
+                    {
+                        return Ok(email.to_string());
+                    }
+                }
+            }
+        }
+
+        // 2. Try Drive API about endpoint via standard HTTPS client (system proxy / direct)
+        if let Ok(client) = crate::api::client_builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            if let Ok(response) = client
+                .get("https://www.googleapis.com/drive/v3/about")
+                .query(&[("fields", "user(emailAddress)")])
+                .bearer_auth(token)
+                .send()
+            {
+                if let Ok(text) = response.text() {
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(email) = data["user"]["emailAddress"]
+                            .as_str()
+                            .filter(|e| !e.is_empty())
+                        {
+                            return Ok(email.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Try Google OAuth2 UserInfo endpoint
+        if let Ok(client) = crate::api::client_builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            if let Ok(response) = client
+                .get("https://www.googleapis.com/oauth2/v3/userinfo")
+                .bearer_auth(token)
+                .send()
+            {
+                if let Ok(text) = response.text() {
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(email) = data
+                            .get("email")
+                            .and_then(|v| v.as_str())
+                            .filter(|e| !e.is_empty())
+                        {
+                            return Ok(email.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        bail!("Unable to determine Google account email from Drive API or UserInfo endpoints")
     }
 }
