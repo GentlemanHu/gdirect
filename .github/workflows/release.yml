@@ -219,9 +219,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-linux-android
-            ndk_platform: 24
+            ndk_platform: 21
           - target: armv7-linux-androideabi
-            ndk_platform: 24
+            ndk_platform: 21
     steps:
       - uses: actions/checkout@v4
         with:
