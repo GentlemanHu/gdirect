@@ -469,7 +469,7 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     let sessions = state.engine.active_sessions();
 
     let res = StatusResponse {
-        version: "0.9.0-streaming-gateway",
+        version: concat!(env!("CARGO_PKG_VERSION"), "-streaming-gateway"),
         account: state.api.read().unwrap().account.clone(),
         direct_ip: ip
             .map(|i| i.to_string())

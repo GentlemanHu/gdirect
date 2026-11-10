@@ -12,28 +12,72 @@ jobs:
   sync_latest_from_upstream:
     name: Sync latest commits from upstream repo
     runs-on: ubuntu-latest
-    # if: ${{ github.event.repository.fork }}
 
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
-          upstream_sync_repo: mizorewww/gdirect
-          upstream_sync_branch: main
-          target_sync_branch: upstream-main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          fetch-depth: 0
 
-          # Set test_mode true to run tests instead of the true action!!
-          test_mode: false
-
-      - name: Sync check
-        if: failure()
+      - name: Sync upstream and check merge status
+        shell: bash
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更或分支合并冲突，导致自动同步暂停，你需要手动 Sync Fork 一次。"
-          exit 1
+          set -euo pipefail
+          git config user.name "GentlemanHu"
+          git config user.email "GentlemanHu@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/mizorewww/gdirect.git
+          git fetch upstream main
+
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          UPSTREAM_MSG=$(git log -1 --pretty="%h %s" upstream/main)
+          echo "Upstream main HEAD: $UPSTREAM_MSG ($UPSTREAM_SHA)"
+
+          # Ensure local upstream-main tracks origin/upstream-main if present
+          git fetch origin upstream-main:refs/remotes/origin/upstream-main 2>/dev/null || true
+
+          # Fast-forward local upstream-main to upstream/main
+          git branch -f upstream-main upstream/main
+          if git push origin upstream-main; then
+            echo "Updated origin/upstream-main -> $UPSTREAM_SHA"
+          else
+            echo "::warning::无法通过 GITHUB_TOKEN 推送 upstream-main（上游可能修改了 .github/workflows/，GitHub 安全策略限制自动更新 workflow 文件）。"
+          fi
+
+          # Check if main already includes all upstream commits
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "### Upstream Sync Status" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ \`main\` 已包含上游最新提交 (\`$UPSTREAM_MSG\`)，无需合并。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Attempt automatic merge if no workflow files are modified
+          WORKFLOW_CHANGES=$(git diff --name-only HEAD..upstream/main -- .github/workflows/ || true)
+          if [ -n "$WORKFLOW_CHANGES" ]; then
+            echo "::warning::上游更新包含 .github/workflows 文件变更 ($WORKFLOW_CHANGES)，受限于 GITHUB_TOKEN 权限需手动本地合并。"
+            {
+              echo "### Upstream Sync Status"
+              echo "⚠️ 检测到上游新提交: \`$UPSTREAM_MSG\`"
+              echo "- 变更涉及 GitHub Workflows 文件，需在本地合并后推送："
+              echo '```bash'
+              echo "git fetch upstream main && git merge upstream/main"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if git merge --no-edit -m "merge: sync upstream updates ($UPSTREAM_MSG)" upstream/main; then
+            git push origin main
+            echo "### Upstream Sync Status" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ 已自动无冲突合并上游更新 (\`$UPSTREAM_MSG\`) 至 \`main\`。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+            git merge --abort
+            echo "::warning::上游更新 ($UPSTREAM_MSG) 与 main 存在冲突文件: $CONFLICTS"
+            {
+              echo "### Upstream Sync Status"
+              echo "⚠️ 检测到上游新提交 \`$UPSTREAM_MSG\`，自动合并存在冲突："
+              echo "$CONFLICTS" | sed 's/^/- `/' | sed 's/$/`/'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
