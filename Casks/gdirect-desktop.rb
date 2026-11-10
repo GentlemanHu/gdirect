@@ -2,9 +2,9 @@
 cask "gdirect-desktop" do
   arch arm: "arm64", intel: "x64"
 
-  version "0.13.0"
-  sha256 arm:   "d704e16c60e52f7c4dd005e7ce7e274d0ec3ca8aea1ee74f4b8774ce6d46f058",
-         intel: "b227a3d803a14124048dc0a3cddcc73b6a40d83aa3ce84be101f9959e6abef4f"
+  version "0.13.2"
+  sha256 arm:   "afdf61c18a2941ec91338d5c641856afc311251963c321b2a30aea0093e844ff",
+         intel: "4a1ec3e31fca841cb45a98875d7219857bc92f99cad7a9591c60fd28f22429ec"
 
   url "https://github.com/mizorewww/gdirect/releases/download/v#{version}/gdirect-desktop-macos-#{arch}.zip"
   name "gdirect"
